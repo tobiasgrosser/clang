@@ -631,12 +631,40 @@ _clang_getDiagnosticFixIt.errcheck = _CXString.from_result
 
 ###
 
+class CodeCompletionChunk:
+    def __init__(self, completionString, key):
+        self.cs = completionString
+        self.key = key
+
+    def __repr__(self):
+        return _clang_getCompletionChunkText(self.cs, self.key).spelling
+
 class CodeCompletionResult(Structure):
     _fields_ = [('cursorKind', c_int), ('completionString', c_void_p)]
+
+    def __len__(self):
+        return _clang_getNumCompletionChunks(self.completionString)
+
+    def __getitem__(self, key):
+        if len(self) <= key:
+            raise IndexError
+        return CodeCompletionChunk(self.completionString, key)
+
+    def __repr__(self):
+        return "".join([str(a) for a in self])
 
 class CCRStructure(Structure):
     _fields_ = [('results', POINTER(CodeCompletionResult)),
                 ('numResults', c_int)]
+
+    def __len__(self):
+        return self.numResults
+
+    def __getitem__(self, key):
+        if len(self) <= key:
+            raise IndexError
+
+        return self.results[key]
 
 class CodeCompletionResults(ClangObject):
     def __init__(self, ptr):
@@ -651,14 +679,7 @@ class CodeCompletionResults(ClangObject):
 
     @property
     def results(self):
-        class ResultsItr:
-            def __init__(self, ccr):
-                self.ccr = ccr
-
-            def __len__(self):
-                return self.ccr.ptr.contents.numResults
-
-        return ResultsItr(self)
+        return self.ptr.contents
 
     @property
     def diagnostics(self):
@@ -1057,6 +1078,14 @@ _clang_codeCompleteGetNumDiagnostics.restype = c_int
 _clang_codeCompleteGetDiagnostic = lib.clang_codeCompleteGetDiagnostic
 _clang_codeCompleteGetDiagnostic.argtypes = [CodeCompletionResults, c_int]
 _clang_codeCompleteGetDiagnostic.restype = Diagnostic
+
+_clang_getCompletionChunkText = lib.clang_getCompletionChunkText
+_clang_getCompletionChunkText.argtypes = [c_void_p, c_int]
+_clang_getCompletionChunkText.restype = _CXString
+
+_clang_getNumCompletionChunks = lib.clang_getNumCompletionChunks
+_clang_getNumCompletionChunks.argtypes = [c_void_p]
+_clang_getNumCompletionChunks.restype = c_int
 
 ###
 

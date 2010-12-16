@@ -9,4 +9,7 @@ def code_complete_source(source, line, column):
 def test_completion_results():
     cr = code_complete_source(""" """, 1, 1)
     assert len(cr.results) > 0 and len(cr.results) < 1000
+    assert "extern" in map(str, cr.results)
+    assert "int" in map(str, cr.results)
+    assert "inline" in map(str, cr.results)
 
