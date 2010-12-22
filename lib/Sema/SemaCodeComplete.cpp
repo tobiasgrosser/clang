@@ -1918,10 +1918,7 @@ static std::string FormatFunctionParameter(ASTContext &Context,
       // then we're done.
       if (BlockPointerTypeLoc *BlockPtr
           = dyn_cast<BlockPointerTypeLoc>(&TL)) {
-        TL = BlockPtr->getPointeeLoc();
-        // Skip any paren typeloc.
-        while (ParenTypeLoc *ParenPtr = dyn_cast<ParenTypeLoc>(&TL))
-          TL = ParenPtr->getInnerLoc();
+        TL = BlockPtr->getPointeeLoc().IgnoreParens();
         Block = dyn_cast<FunctionProtoTypeLoc>(&TL);
       }
       break;
@@ -4174,9 +4171,7 @@ static void AddObjCMethods(ObjCContainerDecl *Container,
 }
 
 
-void Sema::CodeCompleteObjCPropertyGetter(Scope *S, Decl *ClassDecl,
-                                          Decl **Methods,
-                                          unsigned NumMethods) {
+void Sema::CodeCompleteObjCPropertyGetter(Scope *S, Decl *ClassDecl) {
   typedef CodeCompletionResult Result;
 
   // Try to find the interface where getters might live.
@@ -4194,19 +4189,6 @@ void Sema::CodeCompleteObjCPropertyGetter(Scope *S, Decl *ClassDecl,
   ResultBuilder Results(*this, CodeCompletionContext::CCC_Other);
   Results.EnterNewScope();
 
-  // FIXME: We need to do this because Objective-C methods don't get
-  // pushed into DeclContexts early enough. Argh!
-  for (unsigned I = 0; I != NumMethods; ++I) { 
-    if (ObjCMethodDecl *Method
-            = dyn_cast_or_null<ObjCMethodDecl>(Methods[I]))
-      if (Method->isInstanceMethod() &&
-          isAcceptableObjCMethod(Method, MK_ZeroArgSelector, 0, 0)) {
-        Result R = Result(Method, 0);
-        R.AllParametersAreInformative = true;
-        Results.MaybeAddResult(R, CurContext);
-      }
-  }
-
   VisitedSelectorSet Selectors;
   AddObjCMethods(Class, true, MK_ZeroArgSelector, 0, 0, CurContext, Selectors,
                  /*AllowSameLength=*/true, Results);
@@ -4216,9 +4198,7 @@ void Sema::CodeCompleteObjCPropertyGetter(Scope *S, Decl *ClassDecl,
                             Results.data(),Results.size());
 }
 
-void Sema::CodeCompleteObjCPropertySetter(Scope *S, Decl *ObjCImplDecl,
-                                          Decl **Methods,
-                                          unsigned NumMethods) {
+void Sema::CodeCompleteObjCPropertySetter(Scope *S, Decl *ObjCImplDecl) {
   typedef CodeCompletionResult Result;
 
   // Try to find the interface where setters might live.
@@ -4236,19 +4216,6 @@ void Sema::CodeCompleteObjCPropertySetter(Scope *S, Decl *ObjCImplDecl,
   // Find all of the potential getters.
   ResultBuilder Results(*this, CodeCompletionContext::CCC_Other);
   Results.EnterNewScope();
-
-  // FIXME: We need to do this because Objective-C methods don't get
-  // pushed into DeclContexts early enough. Argh!
-  for (unsigned I = 0; I != NumMethods; ++I) { 
-    if (ObjCMethodDecl *Method
-            = dyn_cast_or_null<ObjCMethodDecl>(Methods[I]))
-      if (Method->isInstanceMethod() &&
-          isAcceptableObjCMethod(Method, MK_OneArgSelector, 0, 0)) {
-        Result R = Result(Method, 0);
-        R.AllParametersAreInformative = true;
-        Results.MaybeAddResult(R, CurContext);
-      }
-  }
 
   VisitedSelectorSet Selectors;
   AddObjCMethods(Class, true, MK_OneArgSelector, 0, 0, CurContext, 

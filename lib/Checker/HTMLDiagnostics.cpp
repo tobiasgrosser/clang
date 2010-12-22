@@ -199,7 +199,7 @@ void HTMLDiagnostics::ReportDiag(const PathDiagnostic& D,
 
   std::string DirName = "";
 
-  if (!llvm::sys::Path(Entry->getName()).isAbsolute()) {
+  if (llvm::sys::path::is_relative(Entry->getName())) {
     llvm::sys::Path P = llvm::sys::Path::GetCurrentDirectory();
     DirName = P.str() + "/";
   }
@@ -300,7 +300,7 @@ void HTMLDiagnostics::ReportDiag(const PathDiagnostic& D,
   }
 
   if (FilesMade)
-    FilesMade->push_back(H.getLast());
+    FilesMade->push_back(llvm::sys::path::filename(H.str()));
 
   // Emit the HTML to disk.
   for (RewriteBuffer::iterator I = Buf->begin(), E = Buf->end(); I!=E; ++I)

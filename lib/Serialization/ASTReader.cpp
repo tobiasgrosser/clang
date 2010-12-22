@@ -1703,7 +1703,7 @@ void ASTReader::MaybeAddSystemRootToFilename(std::string &Filename) {
   if (!RelocatablePCH)
     return;
 
-  if (Filename.empty() || llvm::sys::Path(Filename).isAbsolute())
+  if (Filename.empty() || llvm::sys::path::is_absolute(Filename))
     return;
 
   if (isysroot == 0) {
@@ -2278,7 +2278,7 @@ ASTReader::ASTReadResult ASTReader::ReadASTCore(llvm::StringRef FileName,
   std::string ErrStr;
   llvm::error_code ec;
   if (FileName == "-") {
-    F.Buffer.reset(llvm::MemoryBuffer::getSTDIN(ec));
+    ec = llvm::MemoryBuffer::getSTDIN(F.Buffer);
     if (ec)
       ErrStr = ec.message();
   } else
@@ -2670,7 +2670,8 @@ void ASTReader::ReadUserDiagnosticMappings(Diagnostic &Diag) {
   while (Idx < UserDiagMappings.size()) {
     unsigned DiagID = UserDiagMappings[Idx++];
     unsigned Map = UserDiagMappings[Idx++];
-    Diag.setDiagnosticMappingInternal(DiagID, Map, /*isUser=*/true);
+    Diag.setDiagnosticMappingInternal(DiagID, Map, Diag.GetCurDiagState(),
+                                      /*isUser=*/true);
   }
 }
 
@@ -2842,28 +2843,29 @@ QualType ASTReader::ReadTypeRecord(unsigned Index) {
 
   case TYPE_FUNCTION_PROTO: {
     QualType ResultType = GetType(Record[0]);
-    bool NoReturn = Record[1];
-    unsigned RegParm = Record[2];
-    CallingConv CallConv = (CallingConv)Record[3];
+
+    FunctionProtoType::ExtProtoInfo EPI;
+    EPI.ExtInfo = FunctionType::ExtInfo(/*noreturn*/ Record[1],
+                                        /*regparm*/ Record[2],
+                                        static_cast<CallingConv>(Record[3]));
+
     unsigned Idx = 4;
     unsigned NumParams = Record[Idx++];
     llvm::SmallVector<QualType, 16> ParamTypes;
     for (unsigned I = 0; I != NumParams; ++I)
       ParamTypes.push_back(GetType(Record[Idx++]));
-    bool isVariadic = Record[Idx++];
-    unsigned Quals = Record[Idx++];
-    bool hasExceptionSpec = Record[Idx++];
-    bool hasAnyExceptionSpec = Record[Idx++];
-    unsigned NumExceptions = Record[Idx++];
+
+    EPI.Variadic = Record[Idx++];
+    EPI.TypeQuals = Record[Idx++];
+    EPI.HasExceptionSpec = Record[Idx++];
+    EPI.HasAnyExceptionSpec = Record[Idx++];
+    EPI.NumExceptions = Record[Idx++];
     llvm::SmallVector<QualType, 2> Exceptions;
-    for (unsigned I = 0; I != NumExceptions; ++I)
+    for (unsigned I = 0; I != EPI.NumExceptions; ++I)
       Exceptions.push_back(GetType(Record[Idx++]));
+    EPI.Exceptions = Exceptions.data();
     return Context->getFunctionType(ResultType, ParamTypes.data(), NumParams,
-                                    isVariadic, Quals, hasExceptionSpec,
-                                    hasAnyExceptionSpec, NumExceptions,
-                                    Exceptions.data(),
-                                    FunctionType::ExtInfo(NoReturn, RegParm,
-                                                          CallConv));
+                                    EPI);
   }
 
   case TYPE_UNRESOLVED_USING:
@@ -2926,6 +2928,18 @@ QualType ASTReader::ReadTypeRecord(unsigned Index) {
     }
     QualType InnerType = GetType(Record[0]);
     return Context->getParenType(InnerType);
+  }
+
+  case TYPE_PACK_EXPANSION: {
+    if (Record.size() != 1) {
+      Error("incorrect encoding of pack expansion type");
+      return QualType();
+    }
+    QualType Pattern = GetType(Record[0]);
+    if (Pattern.isNull())
+      return QualType();
+
+    return Context->getPackExpansionType(Pattern);
   }
 
   case TYPE_ELABORATED: {
@@ -3226,6 +3240,9 @@ void TypeLocReader::VisitDependentTemplateSpecializationTypeLoc(
         Reader.GetTemplateArgumentLocInfo(F,
                                           TL.getTypePtr()->getArg(I).getKind(),
                                           Record, Idx));
+}
+void TypeLocReader::VisitPackExpansionTypeLoc(PackExpansionTypeLoc TL) {
+  TL.setEllipsisLoc(ReadSourceLocation(Record, Idx));
 }
 void TypeLocReader::VisitObjCInterfaceTypeLoc(ObjCInterfaceTypeLoc TL) {
   TL.setNameLoc(ReadSourceLocation(Record, Idx));

@@ -338,6 +338,7 @@ public:
   // FIXME: Implement visitors here when the unimplemented TypeLocs get
   // implemented
   bool VisitTypeOfExprTypeLoc(TypeOfExprTypeLoc TL);
+  bool VisitPackExpansionTypeLoc(PackExpansionTypeLoc TL);
   bool VisitTypeOfTypeLoc(TypeOfTypeLoc TL);
 
   // Data-recursive visitor functions.
@@ -409,7 +410,20 @@ CursorVisitor::getPreprocessedEntities() {
     = *AU->getPreprocessor().getPreprocessingRecord();
   
   bool OnlyLocalDecls
-    = !AU->isMainFileAST() && AU->getOnlyLocalDecls();
+    = !AU->isMainFileAST() && AU->getOnlyLocalDecls(); 
+  
+  if (OnlyLocalDecls && RegionOfInterest.isValid()) {
+    // If we would only look at local declarations but we have a region of 
+    // interest, check whether that region of interest is in the main file.
+    // If not, we should traverse all declarations.
+    // FIXME: My kingdom for a proper binary search approach to finding
+    // cursors!
+    std::pair<FileID, unsigned> Location
+      = AU->getSourceManager().getDecomposedInstantiationLoc(
+                                                   RegionOfInterest.getBegin());
+    if (Location.first != AU->getSourceManager().getMainFileID())
+      OnlyLocalDecls = false;
+  }
   
   PreprocessingRecord::iterator StartEntity, EndEntity;
   if (OnlyLocalDecls) {
@@ -693,7 +707,7 @@ bool CursorVisitor::VisitFunctionDecl(FunctionDecl *ND) {
   if (TypeSourceInfo *TSInfo = ND->getTypeSourceInfo()) {
     // Visit the function declaration's syntactic components in the order
     // written. This requires a bit of work.
-    TypeLoc TL = TSInfo->getTypeLoc();
+    TypeLoc TL = TSInfo->getTypeLoc().IgnoreParens();
     FunctionTypeLoc *FTL = dyn_cast<FunctionTypeLoc>(&TL);
     
     // If we have a function declared directly (without the use of a typedef),
@@ -1223,12 +1237,9 @@ bool CursorVisitor::VisitTemplateArgumentLoc(const TemplateArgumentLoc &TAL) {
   switch (TAL.getArgument().getKind()) {
   case TemplateArgument::Null:
   case TemplateArgument::Integral:
+  case TemplateArgument::Pack:
     return false;
       
-  case TemplateArgument::Pack:
-    // FIXME: Implement when variadic templates come along.
-    return false;
-
   case TemplateArgument::Type:
     if (TypeSourceInfo *TSInfo = TAL.getTypeSourceInfo())
       return Visit(TSInfo->getTypeLoc());
@@ -1433,6 +1444,10 @@ bool CursorVisitor::VisitTypeOfTypeLoc(TypeOfTypeLoc TL) {
     return Visit(TSInfo->getTypeLoc());
 
   return false;
+}
+
+bool CursorVisitor::VisitPackExpansionTypeLoc(PackExpansionTypeLoc TL) {
+  return Visit(TL.getPatternLoc());
 }
 
 bool CursorVisitor::VisitCXXRecordDecl(CXXRecordDecl *D) {
@@ -4503,12 +4518,34 @@ CXLanguageKind clang_getCursorLanguage(CXCursor cursor) {
 
   return CXLanguage_Invalid;
 }
-  
+
+ /// \brief If the given cursor is the "templated" declaration
+ /// descibing a class or function template, return the class or
+ /// function template.
+static Decl *maybeGetTemplateCursor(Decl *D) {
+  if (!D)
+    return 0;
+
+  if (FunctionDecl *FD = dyn_cast<FunctionDecl>(D))
+    if (FunctionTemplateDecl *FunTmpl = FD->getDescribedFunctionTemplate())
+      return FunTmpl;
+
+  if (CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(D))
+    if (ClassTemplateDecl *ClassTmpl = RD->getDescribedClassTemplate())
+      return ClassTmpl;
+
+  return D;
+}
+
 CXCursor clang_getCursorSemanticParent(CXCursor cursor) {
   if (clang_isDeclaration(cursor.kind)) {
     if (Decl *D = getCursorDecl(cursor)) {
       DeclContext *DC = D->getDeclContext();
-      return MakeCXCursor(cast<Decl>(DC), getCursorTU(cursor));
+      if (!DC)
+        return clang_getNullCursor();
+
+      return MakeCXCursor(maybeGetTemplateCursor(cast<Decl>(DC)), 
+                          getCursorTU(cursor));
     }
   }
   
@@ -4524,7 +4561,11 @@ CXCursor clang_getCursorLexicalParent(CXCursor cursor) {
   if (clang_isDeclaration(cursor.kind)) {
     if (Decl *D = getCursorDecl(cursor)) {
       DeclContext *DC = D->getLexicalDeclContext();
-      return MakeCXCursor(cast<Decl>(DC), getCursorTU(cursor));
+      if (!DC)
+        return clang_getNullCursor();
+
+      return MakeCXCursor(maybeGetTemplateCursor(cast<Decl>(DC)), 
+                          getCursorTU(cursor));
     }
   }
 

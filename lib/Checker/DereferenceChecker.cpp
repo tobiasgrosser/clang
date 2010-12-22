@@ -28,7 +28,7 @@ class DereferenceChecker : public Checker {
 public:
   DereferenceChecker() : BT_null(0), BT_undef(0) {}
   static void *getTag() { static int tag = 0; return &tag; }
-  void VisitLocation(CheckerContext &C, const Stmt *S, SVal location);
+  void visitLocation(CheckerContext &C, const Stmt *S, SVal location);
 
   std::pair<ExplodedNode * const*, ExplodedNode * const*>
   getImplicitNodes() const {
@@ -83,11 +83,11 @@ void DereferenceChecker::AddDerefSource(llvm::raw_ostream &os,
   }
 }
 
-void DereferenceChecker::VisitLocation(CheckerContext &C, const Stmt *S,
+void DereferenceChecker::visitLocation(CheckerContext &C, const Stmt *S,
                                        SVal l) {
   // Check for dereference of an undefined value.
   if (l.isUndef()) {
-    if (ExplodedNode *N = C.GenerateSink()) {
+    if (ExplodedNode *N = C.generateSink()) {
       if (!BT_undef)
         BT_undef = new BuiltinBug("Dereference of undefined pointer value");
 
@@ -114,7 +114,7 @@ void DereferenceChecker::VisitLocation(CheckerContext &C, const Stmt *S,
   if (nullState) {
     if (!notNullState) {
       // Generate an error node.
-      ExplodedNode *N = C.GenerateSink(nullState);
+      ExplodedNode *N = C.generateSink(nullState);
       if (!N)
         return;
 
@@ -125,6 +125,11 @@ void DereferenceChecker::VisitLocation(CheckerContext &C, const Stmt *S,
 
       llvm::SmallString<100> buf;
       llvm::SmallVector<SourceRange, 2> Ranges;
+      
+      // Walk through lvalue casts to get the original expression
+      // that syntactically caused the load.
+      if (const Expr *expr = dyn_cast<Expr>(S))
+        S = expr->IgnoreParenLValueCasts();
 
       switch (S->getStmtClass()) {
         case Stmt::ArraySubscriptExprClass: {
@@ -188,7 +193,7 @@ void DereferenceChecker::VisitLocation(CheckerContext &C, const Stmt *S,
       // Otherwise, we have the case where the location could either be
       // null or not-null.  Record the error node as an "implicit" null
       // dereference.
-      if (ExplodedNode *N = C.GenerateSink(nullState))
+      if (ExplodedNode *N = C.generateSink(nullState))
         ImplicitNullDerefNodes.push_back(N);
     }
   }

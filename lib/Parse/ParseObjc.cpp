@@ -421,13 +421,12 @@ void Parser::ParseObjCInterfaceDeclList(Decl *interfaceDecl,
 
     case tok::objc_property:
       if (!getLang().ObjC2)
-        Diag(AtLoc, diag::err_objc_propertoes_require_objc2);
+        Diag(AtLoc, diag::err_objc_properties_require_objc2);
 
       ObjCDeclSpec OCDS;
       // Parse property attribute list, if any.
       if (Tok.is(tok::l_paren))
-        ParseObjCPropertyAttribute(OCDS, interfaceDecl,
-                                   allMethods.data(), allMethods.size());
+        ParseObjCPropertyAttribute(OCDS, interfaceDecl);
 
       ObjCPropertyCallback Callback(*this, interfaceDecl, allProperties,
                                     OCDS, AtLoc, MethodImplKind);
@@ -476,9 +475,7 @@ void Parser::ParseObjCInterfaceDeclList(Decl *interfaceDecl,
 ///     copy
 ///     nonatomic
 ///
-void Parser::ParseObjCPropertyAttribute(ObjCDeclSpec &DS, Decl *ClassDecl,
-                                        Decl **Methods, 
-                                        unsigned NumMethods) {
+void Parser::ParseObjCPropertyAttribute(ObjCDeclSpec &DS, Decl *ClassDecl) {
   assert(Tok.getKind() == tok::l_paren);
   SourceLocation LHSLoc = ConsumeParen(); // consume '('
 
@@ -509,6 +506,8 @@ void Parser::ParseObjCPropertyAttribute(ObjCDeclSpec &DS, Decl *ClassDecl,
       DS.setPropertyAttributes(ObjCDeclSpec::DQ_PR_copy);
     else if (II->isStr("nonatomic"))
       DS.setPropertyAttributes(ObjCDeclSpec::DQ_PR_nonatomic);
+    else if (II->isStr("atomic"))
+      DS.setPropertyAttributes(ObjCDeclSpec::DQ_PR_atomic);
     else if (II->isStr("getter") || II->isStr("setter")) {
       bool IsSetter = II->getNameStart()[0] == 's';
 
@@ -521,11 +520,9 @@ void Parser::ParseObjCPropertyAttribute(ObjCDeclSpec &DS, Decl *ClassDecl,
 
       if (Tok.is(tok::code_completion)) {
         if (IsSetter)
-          Actions.CodeCompleteObjCPropertySetter(getCurScope(), ClassDecl,
-                                                 Methods, NumMethods);
+          Actions.CodeCompleteObjCPropertySetter(getCurScope(), ClassDecl);
         else
-          Actions.CodeCompleteObjCPropertyGetter(getCurScope(), ClassDecl,
-                                                 Methods, NumMethods);
+          Actions.CodeCompleteObjCPropertyGetter(getCurScope(), ClassDecl);
         ConsumeCodeCompletionToken();
       }
 

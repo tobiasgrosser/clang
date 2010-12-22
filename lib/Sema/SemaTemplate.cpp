@@ -536,6 +536,11 @@ Decl *Sema::ActOnTypeParameter(Scope *S, bool Typename, bool Ellipsis,
       Diag(EqualLoc, diag::err_template_param_pack_default_arg);
       return Param;
     }
+
+    // Check for unexpanded parameter packs.
+    if (DiagnoseUnexpandedParameterPack(Loc, DefaultTInfo, 
+                                        UPPC_DefaultArgument))
+      return Param;
     
     // Check the template argument itself.
     if (CheckTemplateArgument(Param, DefaultTInfo)) {
@@ -626,7 +631,7 @@ Decl *Sema::ActOnNonTypeTemplateParameter(Scope *S, Declarator &D,
     T = Context.IntTy; // Recover with an 'int' type.
     Invalid = true;
   }
-
+  
   NonTypeTemplateParmDecl *Param
     = NonTypeTemplateParmDecl::Create(Context, Context.getTranslationUnitDecl(),
                                       D.getIdentifierLoc(),
@@ -642,6 +647,10 @@ Decl *Sema::ActOnNonTypeTemplateParameter(Scope *S, Declarator &D,
   
   // Check the well-formedness of the default template argument, if provided.
   if (Default) {  
+    // Check for unexpanded parameter packs.
+    if (DiagnoseUnexpandedParameterPack(Default, UPPC_DefaultArgument))
+      return Param;
+
     TemplateArgument Converted;
     if (CheckTemplateArgument(Param, Param->getType(), Default, Converted)) {
       Param->setInvalidDecl();
@@ -683,6 +692,12 @@ Decl *Sema::ActOnTemplateTemplateParameter(Scope* S,
     IdResolver.AddDecl(Param);
   }
 
+  if (Params->size() == 0) {
+    Diag(Param->getLocation(), diag::err_template_template_parm_no_parms)
+    << SourceRange(Params->getLAngleLoc(), Params->getRAngleLoc());
+    Param->setInvalidDecl();
+  }
+
   if (!Default.isInvalid()) {
     // Check only that we have a template template argument. We don't want to
     // try to check well-formedness now, because our template template parameter
@@ -699,14 +714,15 @@ Decl *Sema::ActOnTemplateTemplateParameter(Scope* S,
       return Param;
     }
     
+    // Check for unexpanded parameter packs.
+    if (DiagnoseUnexpandedParameterPack(DefaultArg.getLocation(), 
+                                        DefaultArg.getArgument().getAsTemplate(),
+                                        UPPC_DefaultArgument))
+      return Param;
+    
     Param->setDefaultArgument(DefaultArg, false);
   }
   
-  if (Params->size() == 0) {
-    Diag(Param->getLocation(), diag::err_template_template_parm_no_parms)
-      << SourceRange(Params->getLAngleLoc(), Params->getRAngleLoc());
-    Param->setInvalidDecl();
-  }
   return Param;
 }
 
@@ -1027,6 +1043,30 @@ static bool DiagnoseDefaultTemplateArgument(Sema &S,
   return false;
 }
 
+/// \brief Check for unexpanded parameter packs within the template parameters
+/// of a template template parameter, recursively.
+bool DiagnoseUnexpandedParameterPacks(Sema &S, TemplateTemplateParmDecl *TTP){
+  TemplateParameterList *Params = TTP->getTemplateParameters();
+  for (unsigned I = 0, N = Params->size(); I != N; ++I) {
+    NamedDecl *P = Params->getParam(I);
+    if (NonTypeTemplateParmDecl *NTTP = dyn_cast<NonTypeTemplateParmDecl>(P)) {
+      if (S.DiagnoseUnexpandedParameterPack(NTTP->getLocation(), 
+                                            NTTP->getTypeSourceInfo(),
+                                      Sema::UPPC_NonTypeTemplateParameterType))
+        return true;
+      
+      continue;
+    }
+    
+    if (TemplateTemplateParmDecl *InnerTTP 
+                                        = dyn_cast<TemplateTemplateParmDecl>(P))
+      if (DiagnoseUnexpandedParameterPacks(S, InnerTTP))
+        return true;
+  }
+    
+  return false;
+}
+
 /// \brief Checks the validity of a template parameter list, possibly
 /// considering the template parameter list from a previous
 /// declaration.
@@ -1131,6 +1171,14 @@ bool Sema::CheckTemplateParameterList(TemplateParameterList *NewParams,
         MissingDefaultArg = true;
     } else if (NonTypeTemplateParmDecl *NewNonTypeParm
                = dyn_cast<NonTypeTemplateParmDecl>(*NewParam)) {
+      // Check for unexpanded parameter packs.
+      if (DiagnoseUnexpandedParameterPack(NewNonTypeParm->getLocation(),
+                                          NewNonTypeParm->getTypeSourceInfo(), 
+                                          UPPC_NonTypeTemplateParameterType)) {
+        Invalid = true;
+        continue;
+      }
+
       // Check the presence of a default argument here.
       if (NewNonTypeParm->hasDefaultArgument() && 
           DiagnoseDefaultTemplateArgument(*this, TPC, 
@@ -1169,6 +1217,13 @@ bool Sema::CheckTemplateParameterList(TemplateParameterList *NewParams,
       // Check the presence of a default argument here.
       TemplateTemplateParmDecl *NewTemplateParm
         = cast<TemplateTemplateParmDecl>(*NewParam);
+      
+      // Check for unexpanded parameter packs, recursively.
+      if (DiagnoseUnexpandedParameterPacks(*this, NewTemplateParm)) {
+        Invalid = true;
+        continue;
+      }
+      
       if (NewTemplateParm->hasDefaultArgument() && 
           DiagnoseDefaultTemplateArgument(*this, TPC, 
                                           NewTemplateParm->getLocation(), 
@@ -1709,11 +1764,8 @@ ExprResult Sema::BuildTemplateIdExpr(const CXXScopeSpec &SS,
   // We don't want lookup warnings at this point.
   R.suppressDiagnostics();
   
-  bool Dependent
-    = UnresolvedLookupExpr::ComputeDependence(R.begin(), R.end(),
-                                              &TemplateArgs);
   UnresolvedLookupExpr *ULE
-    = UnresolvedLookupExpr::Create(Context, Dependent, R.getNamingClass(),
+    = UnresolvedLookupExpr::Create(Context, R.getNamingClass(),
                                    Qualifier, QualifierRange,
                                    R.getLookupNameInfo(),
                                    RequiresADL, TemplateArgs, 
@@ -2243,8 +2295,6 @@ bool Sema::CheckTemplateArgument(NamedDecl *Param,
                                 MultiLevelTemplateArgumentList(TemplateArgs)));
     if (!TempParm)
       return true;
-    
-    // FIXME: TempParam is leaked.
   }
     
   switch (Arg.getArgument().getKind()) {
@@ -2325,28 +2375,39 @@ bool Sema::CheckTemplateArgumentList(TemplateDecl *Template,
   //   a template-id shall match the type and form specified for the
   //   corresponding parameter declared by the template in its
   //   template-parameter-list.
+  llvm::SmallVector<TemplateArgument, 2> ArgumentPack;
+  TemplateParameterList::iterator Param = Params->begin(),
+                               ParamEnd = Params->end();
   unsigned ArgIdx = 0;
-  for (TemplateParameterList::iterator Param = Params->begin(),
-                                       ParamEnd = Params->end();
-       Param != ParamEnd; ++Param, ++ArgIdx) {
+  while (Param != ParamEnd) {
     if (ArgIdx > NumArgs && PartialTemplateArgs)
       break;
 
-    // If we have a template parameter pack, check every remaining template
-    // argument against that template parameter pack.
-    if ((*Param)->isTemplateParameterPack()) {
-      Diag(TemplateLoc, diag::err_variadic_templates_unsupported);
-      return true;
-    }
-    
     if (ArgIdx < NumArgs) {
       // Check the template argument we were given.
       if (CheckTemplateArgument(*Param, TemplateArgs[ArgIdx], Template, 
                                 TemplateLoc, RAngleLoc, Converted))
         return true;
       
+      if ((*Param)->isTemplateParameterPack()) {
+        // The template parameter was a template parameter pack, so take the
+        // deduced argument and place it on the argument pack. Note that we
+        // stay on the same template parameter so that we can deduce more
+        // arguments.
+        ArgumentPack.push_back(Converted.back());
+        Converted.pop_back();
+      } else {
+        // Move to the next template parameter.
+        ++Param;
+      }
+      ++ArgIdx;
       continue;
     }
+    
+    // If we have a template parameter pack with no more corresponding 
+    // arguments, just break out now and we'll fill in the argument pack below.
+    if ((*Param)->isTemplateParameterPack())
+      break;
     
     // We have a default template argument that we will use.
     TemplateArgumentLoc Arg;
@@ -2422,8 +2483,31 @@ bool Sema::CheckTemplateArgumentList(TemplateDecl *Template,
     if (CheckTemplateArgument(*Param, Arg, Template, TemplateLoc,
                               RAngleLoc, Converted))
       return true;
+    
+    // Move to the next template parameter and argument.
+    ++Param;
+    ++ArgIdx;
   }
-
+  
+  // Form argument packs for each of the parameter packs remaining.
+  while (Param != ParamEnd) {
+    if ((*Param)->isTemplateParameterPack()) {     
+      // The parameter pack takes the contents of the current argument pack,
+      // which we built up earlier.
+      if (ArgumentPack.empty()) {
+        Converted.push_back(TemplateArgument(0, 0));
+      } else {
+        TemplateArgument *PackedArgs
+          = new (Context) TemplateArgument [ArgumentPack.size()];
+        std::copy(ArgumentPack.begin(), ArgumentPack.end(), PackedArgs);
+        Converted.push_back(TemplateArgument(PackedArgs, ArgumentPack.size()));
+        ArgumentPack.clear();
+      }
+    }
+    
+    ++Param;
+  }
+  
   return Invalid;
 }
 
@@ -2586,6 +2670,11 @@ bool UnnamedLocalNoLinkageFinder::VisitDependentNameType(
 bool UnnamedLocalNoLinkageFinder::VisitDependentTemplateSpecializationType(
                                  const DependentTemplateSpecializationType* T) {
   return VisitNestedNameSpecifier(T->getQualifier());
+}
+
+bool UnnamedLocalNoLinkageFinder::VisitPackExpansionType(
+                                                   const PackExpansionType* T) {
+  return Visit(T->getPattern());
 }
 
 bool UnnamedLocalNoLinkageFinder::VisitObjCObjectType(const ObjCObjectType *) {
@@ -3466,7 +3555,16 @@ Sema::BuildExpressionFromIntegralTemplateArgument(const TemplateArgument &Arg,
                                             T,
                                             Loc));
 
-  return Owned(IntegerLiteral::Create(Context, *Arg.getAsIntegral(), T, Loc));
+  QualType BT;
+  if (const EnumType *ET = T->getAs<EnumType>())
+    BT = ET->getDecl()->getPromotionType();
+  else
+    BT = T;
+
+  Expr *E = IntegerLiteral::Create(Context, *Arg.getAsIntegral(), BT, Loc);
+  ImpCastExprToType(E, T, CK_IntegralCast);
+
+  return Owned(E);
 }
 
 
@@ -3989,6 +4087,12 @@ Sema::ActOnClassTemplateSpecialization(Scope *S, unsigned TagSpec,
   if (TemplateParams && TemplateParams->size() > 0) {
     isPartialSpecialization = true;
 
+    if (TUK == TUK_Friend) {
+      Diag(KWLoc, diag::err_partial_specialization_friend)
+        << SourceRange(LAngleLoc, RAngleLoc);
+      return true;
+    }
+    
     // C++ [temp.class.spec]p10:
     //   The template parameter list of a specialization shall not
     //   contain default template argument values.
@@ -4281,6 +4385,9 @@ Sema::ActOnClassTemplateSpecialization(Scope *S, unsigned TagSpec,
       return true;
     }
   }
+
+  if (Attr)
+    ProcessDeclAttributeList(S, Specialization, Attr);
 
   // Build the fully-sugared type for this class template
   // specialization as the user wrote in the specialization
@@ -5867,120 +5974,32 @@ std::string
 Sema::getTemplateArgumentBindingsText(const TemplateParameterList *Params,
                                       const TemplateArgument *Args,
                                       unsigned NumArgs) {
-  std::string Result;
+  llvm::SmallString<128> Str;
+  llvm::raw_svector_ostream Out(Str);
 
   if (!Params || Params->size() == 0 || NumArgs == 0)
-    return Result;
+    return std::string();
   
   for (unsigned I = 0, N = Params->size(); I != N; ++I) {
     if (I >= NumArgs)
       break;
     
     if (I == 0)
-      Result += "[with ";
+      Out << "[with ";
     else
-      Result += ", ";
+      Out << ", ";
     
     if (const IdentifierInfo *Id = Params->getParam(I)->getIdentifier()) {
-      Result += Id->getName();
+      Out << Id->getName();
     } else {
-      Result += '$';
-      Result += llvm::utostr(I);
+      Out << '$' << I;
     }
     
-    Result += " = ";
-    
-    switch (Args[I].getKind()) {
-      case TemplateArgument::Null:
-        Result += "<no value>";
-        break;
-        
-      case TemplateArgument::Type: {
-        std::string TypeStr;
-        Args[I].getAsType().getAsStringInternal(TypeStr, 
-                                                Context.PrintingPolicy);
-        Result += TypeStr;
-        break;
-      }
-        
-      case TemplateArgument::Declaration: {
-        bool Unnamed = true;
-        if (NamedDecl *ND = dyn_cast_or_null<NamedDecl>(Args[I].getAsDecl())) {
-          if (ND->getDeclName()) {
-            Unnamed = false;
-            Result += ND->getNameAsString();
-          }
-        }
-        
-        if (Unnamed) {
-          Result += "<anonymous>";
-        }
-        break;
-      }
-        
-      case TemplateArgument::Template: {
-        std::string Str;
-        llvm::raw_string_ostream OS(Str);
-        Args[I].getAsTemplate().print(OS, Context.PrintingPolicy);
-        Result += OS.str();
-        break;
-      }
-        
-      case TemplateArgument::Integral: {
-        Result += Args[I].getAsIntegral()->toString(10);
-        break;
-      }
-        
-      case TemplateArgument::Expression: {
-        // FIXME: This is non-optimal, since we're regurgitating the
-        // expression we were given.
-        std::string Str; 
-        {
-          llvm::raw_string_ostream OS(Str);
-          Args[I].getAsExpr()->printPretty(OS, Context, 0,
-                                           Context.PrintingPolicy);
-        }
-        Result += Str;
-        break;
-      }
-        
-      case TemplateArgument::Pack:
-        // FIXME: Format template argument packs
-        Result += "<template argument pack>";
-        break;        
-    }
+    Out << " = ";
+    Args[I].print(Context.PrintingPolicy, Out);
   }
-  
-  Result += ']';
-  return Result;
-}
 
-bool Sema::DiagnoseUnexpandedParameterPack(SourceLocation Loc, 
-                                           TypeSourceInfo *T,
-                                         UnexpandedParameterPackContext UPPC) {
-  // C++0x [temp.variadic]p5:
-  //   An appearance of a name of a parameter pack that is not expanded is 
-  //   ill-formed.
-  if (!T->getType()->containsUnexpandedParameterPack())
-    return false;
-
-  // FIXME: Provide the names and locations of the unexpanded parameter packs.
-  Diag(Loc, diag::err_unexpanded_parameter_pack)
-    << (int)UPPC << T->getTypeLoc().getSourceRange();
-  return true;
-}
-
-bool Sema::DiagnoseUnexpandedParameterPack(Expr *E,
-                                           UnexpandedParameterPackContext UPPC) {
-  // C++0x [temp.variadic]p5:
-  //   An appearance of a name of a parameter pack that is not expanded is 
-  //   ill-formed.
-  if (!E->containsUnexpandedParameterPack())
-    return false;
-
-  // FIXME: Provide the names and locations of the unexpanded parameter packs.
-  Diag(E->getSourceRange().getBegin(), diag::err_unexpanded_parameter_pack)
-    << (int)UPPC << E->getSourceRange();
-  return true;
+  Out << ']';
+  return Out.str();
 }
 

@@ -707,7 +707,14 @@ static bool IsStructurallyEquivalent(StructuralEquivalenceContext &Context,
     }
     break;
   }
-  
+
+  case Type::PackExpansion:
+    if (!IsStructurallyEquivalent(Context,
+                                  cast<PackExpansionType>(T1)->getPattern(),
+                                  cast<PackExpansionType>(T2)->getPattern()))
+      return false;
+    break;
+
   case Type::ObjCInterface: {
     const ObjCInterfaceType *Iface1 = cast<ObjCInterfaceType>(T1);
     const ObjCInterfaceType *Iface2 = cast<ObjCInterfaceType>(T2);
@@ -1473,16 +1480,12 @@ QualType ASTNodeImporter::VisitFunctionProtoType(FunctionProtoType *T) {
       return QualType();
     ExceptionTypes.push_back(ExceptionType);
   }
+
+  FunctionProtoType::ExtProtoInfo EPI = T->getExtProtoInfo();
+  EPI.Exceptions = ExceptionTypes.data();
        
   return Importer.getToContext().getFunctionType(ToResultType, ArgTypes.data(),
-                                                 ArgTypes.size(),
-                                                 T->isVariadic(),
-                                                 T->getTypeQuals(),
-                                                 T->hasExceptionSpec(), 
-                                                 T->hasAnyExceptionSpec(),
-                                                 ExceptionTypes.size(),
-                                                 ExceptionTypes.data(),
-                                                 T->getExtInfo());
+                                                 ArgTypes.size(), EPI);
 }
 
 QualType ASTNodeImporter::VisitTypedefType(TypedefType *T) {

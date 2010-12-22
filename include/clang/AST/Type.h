@@ -92,7 +92,6 @@ namespace clang {
   class TemplateArgument;
   class TemplateArgumentLoc;
   class TemplateArgumentListInfo;
-  class Type;
   class ElaboratedType;
   struct PrintingPolicy;
 
@@ -694,7 +693,9 @@ public:
   /// IgnoreParens - Returns the specified type after dropping any
   /// outer-level parentheses.
   QualType IgnoreParens() const {
-    return QualType::IgnoreParens(*this);
+    if (isa<ParenType>(*this))
+      return QualType::IgnoreParens(*this);
+    return *this;
   }
 
   /// operator==/!= - Indicate whether the specified types and qualifiers are
@@ -925,8 +926,8 @@ protected:
     /// regparm and the calling convention.
     unsigned ExtInfo : 8;
 
-    /// A bit to be used by the subclass.
-    unsigned SubclassInfo : 1;
+    /// Whether the function is variadic.  Only used by FunctionProtoType.
+    unsigned Variadic : 1;
 
     /// TypeQuals - Used only by FunctionProtoType, put here to pack with the
     /// other bitfields.
@@ -2125,9 +2126,13 @@ class FunctionType : public Type {
   QualType ResultType;
 
  public:
-  // This class is used for passing around the information needed to
-  // construct a call. It is not actually used for storage, just for
-  // factoring together common arguments.
+  /// ExtInfo - A class which abstracts out some details necessary for
+  /// making a call.
+  ///
+  /// It is not actually used directly for storing this information in
+  /// a FunctionType, although FunctionType does currently use the
+  /// same bit-pattern.
+  ///
   // If you add a field (say Foo), other than the obvious places (both,
   // constructors, compile failures), what you need to update is
   // * Operator==
@@ -2141,16 +2146,21 @@ class FunctionType : public Type {
   // * TypePrinter::PrintFunctionProto
   // * AST read and write
   // * Codegen
-
   class ExtInfo {
+    // Feel free to rearrange or add bits, but if you go over 8,
+    // you'll need to adjust both the Bits field below and
+    // Type::FunctionTypeBitfields.
+
+    //   |  CC  |noreturn|regparm
+    //   |0 .. 2|   3    |4 ..  6
     enum { CallConvMask = 0x7 };
     enum { NoReturnMask = 0x8 };
     enum { RegParmMask = ~(CallConvMask | NoReturnMask),
            RegParmOffset = 4 };
 
-    unsigned Bits;
+    unsigned char Bits;
 
-    ExtInfo(unsigned Bits) : Bits(Bits) {}
+    ExtInfo(unsigned Bits) : Bits(static_cast<unsigned char>(Bits)) {}
 
     friend class FunctionType;
 
@@ -2196,13 +2206,13 @@ class FunctionType : public Type {
       return ExtInfo((Bits & ~CallConvMask) | (unsigned) cc);
     }
 
-    void Profile(llvm::FoldingSetNodeID &ID) {
+    void Profile(llvm::FoldingSetNodeID &ID) const {
       ID.AddInteger(Bits);
     }
   };
 
 protected:
-  FunctionType(TypeClass tc, QualType res, bool SubclassInfo,
+  FunctionType(TypeClass tc, QualType res, bool variadic,
                unsigned typeQuals, QualType Canonical, bool Dependent,
                bool VariablyModified, bool ContainsUnexpandedParameterPack, 
                ExtInfo Info)
@@ -2210,10 +2220,10 @@ protected:
            ContainsUnexpandedParameterPack), 
       ResultType(res) {
     FunctionTypeBits.ExtInfo = Info.Bits;
-    FunctionTypeBits.SubclassInfo = SubclassInfo;
+    FunctionTypeBits.Variadic = variadic;
     FunctionTypeBits.TypeQuals = typeQuals;
   }
-  bool getSubClassData() const { return FunctionTypeBits.SubclassInfo; }
+  bool isVariadic() const { return FunctionTypeBits.Variadic; }
   unsigned getTypeQuals() const { return FunctionTypeBits.TypeQuals; }
 public:
 
@@ -2276,6 +2286,23 @@ public:
 /// exception specification, but this specification is not part of the canonical
 /// type.
 class FunctionProtoType : public FunctionType, public llvm::FoldingSetNode {
+public:
+  /// ExtProtoInfo - Extra information about a function prototype.
+  struct ExtProtoInfo {
+    ExtProtoInfo() :
+      Variadic(false), HasExceptionSpec(false), HasAnyExceptionSpec(false),
+      TypeQuals(0), NumExceptions(0), Exceptions(0) {}
+
+    FunctionType::ExtInfo ExtInfo;
+    bool Variadic;
+    bool HasExceptionSpec;
+    bool HasAnyExceptionSpec;
+    unsigned char TypeQuals;
+    unsigned NumExceptions;
+    const QualType *Exceptions;
+  };
+
+private:
   /// \brief Determine whether there are any argument types that
   /// contain an unexpanded parameter pack.
   static bool containsAnyUnexpandedParameterPack(const QualType *ArgArray, 
@@ -2287,11 +2314,8 @@ class FunctionProtoType : public FunctionType, public llvm::FoldingSetNode {
     return false;
   }
 
-  FunctionProtoType(QualType Result, const QualType *ArgArray, unsigned numArgs,
-                    bool isVariadic, unsigned typeQuals, bool hasExs,
-                    bool hasAnyExs, const QualType *ExArray,
-                    unsigned numExs, QualType Canonical,
-                    const ExtInfo &Info);
+  FunctionProtoType(QualType result, const QualType *args, unsigned numArgs,
+                    QualType canonical, const ExtProtoInfo &epi);
 
   /// NumArgs - The number of arguments this function has, not counting '...'.
   unsigned NumArgs : 20;
@@ -2302,8 +2326,8 @@ class FunctionProtoType : public FunctionType, public llvm::FoldingSetNode {
   /// HasExceptionSpec - Whether this function has an exception spec at all.
   unsigned HasExceptionSpec : 1;
 
-  /// AnyExceptionSpec - Whether this function has a throw(...) spec.
-  unsigned AnyExceptionSpec : 1;
+  /// HasAnyExceptionSpec - Whether this function has a throw(...) spec.
+  unsigned HasAnyExceptionSpec : 1;
 
   /// ArgInfo - There is an variable size array after the class in memory that
   /// holds the argument types.
@@ -2320,8 +2344,20 @@ public:
     return arg_type_begin()[i];
   }
 
+  ExtProtoInfo getExtProtoInfo() const {
+    ExtProtoInfo EPI;
+    EPI.ExtInfo = getExtInfo();
+    EPI.Variadic = isVariadic();
+    EPI.HasExceptionSpec = hasExceptionSpec();
+    EPI.HasAnyExceptionSpec = hasAnyExceptionSpec();
+    EPI.TypeQuals = static_cast<unsigned char>(getTypeQuals());
+    EPI.NumExceptions = NumExceptions;
+    EPI.Exceptions = exception_begin();
+    return EPI;
+  }
+
   bool hasExceptionSpec() const { return HasExceptionSpec; }
-  bool hasAnyExceptionSpec() const { return AnyExceptionSpec; }
+  bool hasAnyExceptionSpec() const { return HasAnyExceptionSpec; }
   unsigned getNumExceptions() const { return NumExceptions; }
   QualType getExceptionType(unsigned i) const {
     assert(i < NumExceptions && "Invalid exception number!");
@@ -2332,7 +2368,7 @@ public:
       getNumExceptions() == 0;
   }
 
-  bool isVariadic() const { return getSubClassData(); }
+  using FunctionType::isVariadic;
   unsigned getTypeQuals() const { return FunctionType::getTypeQuals(); }
 
   typedef const QualType *arg_type_iterator;
@@ -2361,10 +2397,7 @@ public:
   void Profile(llvm::FoldingSetNodeID &ID);
   static void Profile(llvm::FoldingSetNodeID &ID, QualType Result,
                       arg_type_iterator ArgTys, unsigned NumArgs,
-                      bool isVariadic, unsigned TypeQuals,
-                      bool hasExceptionSpec, bool anyExceptionSpec,
-                      unsigned NumExceptions, exception_iterator Exs,
-                      ExtInfo ExtInfo);
+                      const ExtProtoInfo &EPI);
 };
 
 
@@ -2763,7 +2796,8 @@ public:
   /// enclosing the template arguments.
   static std::string PrintTemplateArgumentList(const TemplateArgument *Args,
                                                unsigned NumArgs,
-                                               const PrintingPolicy &Policy);
+                                               const PrintingPolicy &Policy,
+                                               bool SkipBrackets = false);
 
   static std::string PrintTemplateArgumentList(const TemplateArgumentLoc *Args,
                                                unsigned NumArgs,
@@ -3153,6 +3187,65 @@ public:
     return T->getTypeClass() == DependentTemplateSpecialization;
   }
   static bool classof(const DependentTemplateSpecializationType *T) {
+    return true;
+  }  
+};
+
+/// \brief Represents a pack expansion of types.
+///
+/// Pack expansions are part of C++0x variadic templates. A pack
+/// expansion contains a pattern, which itself contains one or more
+/// "unexpanded" parameter packs. When instantiated, a pack expansion
+/// produces a series of types, each instantiated from the pattern of
+/// the expansion, where the Ith instantiation of the pattern uses the
+/// Ith arguments bound to each of the unexpanded parameter packs. The
+/// pack expansion is considered to "expand" these unexpanded
+/// parameter packs.
+///
+/// \code
+/// template<typename ...Types> struct tuple;
+///
+/// template<typename ...Types> 
+/// struct tuple_of_references {
+///   typedef tuple<Types&...> type;
+/// };
+/// \endcode
+///
+/// Here, the pack expansion \c Types&... is represented via a
+/// PackExpansionType whose pattern is Types&.
+class PackExpansionType : public Type, public llvm::FoldingSetNode {
+  /// \brief The pattern of the pack expansion.
+  QualType Pattern;
+
+  PackExpansionType(QualType Pattern, QualType Canon)
+    : Type(PackExpansion, Canon, /*Dependent=*/true,
+           /*VariableModified=*/Pattern->isVariablyModifiedType(),
+           /*ContainsUnexpandedParameterPack=*/false),
+      Pattern(Pattern) { }
+
+  friend class ASTContext;  // ASTContext creates these
+
+public:
+  /// \brief Retrieve the pattern of this pack expansion, which is the
+  /// type that will be repeatedly instantiated when instantiating the
+  /// pack expansion itself.
+  QualType getPattern() const { return Pattern; }
+
+  bool isSugared() const { return false; }
+  QualType desugar() const { return QualType(this, 0); }
+
+  void Profile(llvm::FoldingSetNodeID &ID) {
+    Profile(ID, getPattern());
+  }
+
+  static void Profile(llvm::FoldingSetNodeID &ID, QualType Pattern) {
+    ID.AddPointer(Pattern.getAsOpaquePtr());
+  }
+
+  static bool classof(const Type *T) {
+    return T->getTypeClass() == PackExpansion;
+  }
+  static bool classof(const PackExpansionType *T) {
     return true;
   }  
 };

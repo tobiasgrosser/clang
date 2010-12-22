@@ -372,11 +372,28 @@ Sema::ActOnCXXTypeid(SourceLocation OpLoc, SourceLocation LParenLoc,
   return BuildCXXTypeId(TypeInfoType, OpLoc, (Expr*)TyOrExpr, RParenLoc);
 }
 
+// Get the CXXRecordDecl associated with QT bypassing 1 level of pointer,
+// reference or array type.
+static CXXRecordDecl *GetCXXRecordOfUuidArg(QualType QT) {
+  Type* Ty = QT.getTypePtr();;
+  if (QT->isPointerType() || QT->isReferenceType())
+    Ty = QT->getPointeeType().getTypePtr();
+  else if (QT->isArrayType())
+    Ty = cast<ArrayType>(QT)->getElementType().getTypePtr();
+
+  return Ty->getAsCXXRecordDecl();
+}
+
 /// \brief Build a Microsoft __uuidof expression with a type operand.
 ExprResult Sema::BuildCXXUuidof(QualType TypeInfoType,
                                 SourceLocation TypeidLoc,
                                 TypeSourceInfo *Operand,
                                 SourceLocation RParenLoc) {
+  // Make sure Operand has an associated GUID.
+  CXXRecordDecl* RD = GetCXXRecordOfUuidArg(Operand->getType());
+  if (!RD || !RD->getAttr<UuidAttr>())
+    return ExprError(Diag(TypeidLoc, diag::err_uuidof_without_guid));
+
   // FIXME: add __uuidof semantic analysis for type operand.
   return Owned(new (Context) CXXUuidofExpr(TypeInfoType.withConst(),
                                            Operand,
@@ -388,6 +405,13 @@ ExprResult Sema::BuildCXXUuidof(QualType TypeInfoType,
                                 SourceLocation TypeidLoc,
                                 Expr *E,
                                 SourceLocation RParenLoc) {
+  // Make sure E has an associated GUID.
+  // 0 is fine also.
+  CXXRecordDecl* RD = GetCXXRecordOfUuidArg(E->getType());
+  if ((!RD || !RD->getAttr<UuidAttr>()) &&
+       !E->isNullPointerConstant(Context, Expr::NPC_ValueDependentIsNull))
+    return ExprError(Diag(TypeidLoc, diag::err_uuidof_without_guid));
+
   // FIXME: add __uuidof semantic analysis for expr operand.
   return Owned(new (Context) CXXUuidofExpr(TypeInfoType.withConst(),
                                            E,
@@ -1074,21 +1098,24 @@ bool Sema::FindAllocationFunctions(SourceLocation StartLoc, SourceRange Range,
     // To perform this comparison, we compute the function type that
     // the deallocation function should have, and use that type both
     // for template argument deduction and for comparison purposes.
+    //
+    // FIXME: this comparison should ignore CC and the like.
     QualType ExpectedFunctionType;
     {
       const FunctionProtoType *Proto
         = OperatorNew->getType()->getAs<FunctionProtoType>();
+
       llvm::SmallVector<QualType, 4> ArgTypes;
       ArgTypes.push_back(Context.VoidPtrTy); 
       for (unsigned I = 1, N = Proto->getNumArgs(); I < N; ++I)
         ArgTypes.push_back(Proto->getArgType(I));
 
+      FunctionProtoType::ExtProtoInfo EPI;
+      EPI.Variadic = Proto->isVariadic();
+
       ExpectedFunctionType
         = Context.getFunctionType(Context.VoidTy, ArgTypes.data(),
-                                  ArgTypes.size(),
-                                  Proto->isVariadic(),
-                                  0, false, false, 0, 0,
-                                  FunctionType::ExtInfo());
+                                  ArgTypes.size(), EPI);
     }
 
     for (LookupResult::iterator D = FoundDelete.begin(), 
@@ -1340,12 +1367,15 @@ void Sema::DeclareGlobalAllocationFunction(DeclarationName Name,
     assert(StdBadAlloc && "Must have std::bad_alloc declared");
     BadAllocType = Context.getTypeDeclType(getStdBadAlloc());
   }
+
+  FunctionProtoType::ExtProtoInfo EPI;
+  EPI.HasExceptionSpec = true;
+  if (HasBadAllocExceptionSpec) {
+    EPI.NumExceptions = 1;
+    EPI.Exceptions = &BadAllocType;
+  }
   
-  QualType FnType = Context.getFunctionType(Return, &Argument, 1, false, 0,
-                                            true, false,
-                                            HasBadAllocExceptionSpec? 1 : 0,
-                                            &BadAllocType,
-                                            FunctionType::ExtInfo());
+  QualType FnType = Context.getFunctionType(Return, &Argument, 1, EPI);
   FunctionDecl *Alloc =
     FunctionDecl::Create(Context, GlobalCtx, SourceLocation(), Name,
                          FnType, /*TInfo=*/0, SC_None,
@@ -1889,8 +1919,7 @@ Sema::PerformImplicitConversion(Expr *&From, QualType ToType,
     if (CheckExceptionSpecCompatibility(From, ToType))
       return true;      
       
-    ImpCastExprToType(From, Context.getNoReturnType(From->getType(), false),
-                      CK_NoOp);
+    ImpCastExprToType(From, ToType, CK_NoOp);
     break;
       
   case ICK_Integral_Promotion:
@@ -3627,7 +3656,8 @@ void Sema::IgnoredValueConversions(Expr *&E) {
 }
 
 ExprResult Sema::ActOnFinishFullExpr(Expr *FullExpr) {
-  if (!FullExpr) return ExprError();
+  if (!FullExpr) 
+    return ExprError();
 
   if (DiagnoseUnexpandedParameterPack(FullExpr))
     return ExprError();

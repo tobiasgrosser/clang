@@ -589,7 +589,21 @@ namespace {
       this->Loc = Loc;
       this->Entity = Entity;
     }
-      
+
+    bool TryExpandParameterPacks(SourceLocation EllipsisLoc,
+                                 SourceRange PatternRange,
+                                 const UnexpandedParameterPack *Unexpanded,
+                                 unsigned NumUnexpanded,
+                                 bool &ShouldExpand,
+                                 unsigned &NumExpansions) {
+      return getSema().CheckParameterPacksForExpansion(EllipsisLoc, 
+                                                       PatternRange, Unexpanded,
+                                                       NumUnexpanded, 
+                                                       TemplateArgs, 
+                                                       ShouldExpand,
+                                                       NumExpansions);
+    }
+
     /// \brief Transform the given declaration by instantiating a reference to
     /// this declaration.
     Decl *TransformDecl(SourceLocation Loc, Decl *D);
@@ -670,6 +684,7 @@ Decl *TemplateInstantiator::TransformDecl(SourceLocation Loc, Decl *D) {
                                             TTP->getPosition()))
         return D;
 
+      // FIXME: Variadic templates index substitution.
       TemplateName Template
         = TemplateArgs(TTP->getDepth(), TTP->getPosition()).getAsTemplate();
       assert(!Template.isNull() && Template.getAsTemplateDecl() &&
@@ -701,8 +716,25 @@ TemplateInstantiator::TransformFirstQualifierInScope(NamedDecl *D,
   if (TemplateTypeParmDecl *TTPD = dyn_cast_or_null<TemplateTypeParmDecl>(D)) {
     const TemplateTypeParmType *TTP 
       = cast<TemplateTypeParmType>(getSema().Context.getTypeDeclType(TTPD));
+    
     if (TTP->getDepth() < TemplateArgs.getNumLevels()) {
-      QualType T = TemplateArgs(TTP->getDepth(), TTP->getIndex()).getAsType();
+      // FIXME: This needs testing w/ member access expressions.
+      TemplateArgument Arg = TemplateArgs(TTP->getDepth(), TTP->getIndex());
+      
+      if (TTP->isParameterPack()) {
+        assert(Arg.getKind() == TemplateArgument::Pack && 
+               "Missing argument pack");
+        
+        if (getSema().ArgumentPackSubstitutionIndex == -1) {
+          // FIXME: Variadic templates fun case.
+          getSema().Diag(Loc, diag::err_pack_expansion_mismatch_unsupported);
+          return 0;
+        }
+        
+        Arg = Arg.pack_begin()[getSema().ArgumentPackSubstitutionIndex];
+      }
+
+      QualType T = Arg.getAsType();
       if (T.isNull())
         return cast_or_null<NamedDecl>(TransformDecl(Loc, D));
       
@@ -844,6 +876,7 @@ ExprResult
 TemplateInstantiator::TransformDeclRefExpr(DeclRefExpr *E) {
   NamedDecl *D = E->getDecl();
   if (NonTypeTemplateParmDecl *NTTP = dyn_cast<NonTypeTemplateParmDecl>(D)) {
+    // FIXME: Variadic templates index substitution.
     if (NTTP->getDepth() < TemplateArgs.getNumLevels())
       return TransformTemplateParmRefExpr(E, NTTP);
     
@@ -895,12 +928,26 @@ TemplateInstantiator::TransformTemplateTypeParmType(TypeLocBuilder &TLB,
       return TL.getType();
     }
 
-    assert(TemplateArgs(T->getDepth(), T->getIndex()).getKind()
-             == TemplateArgument::Type &&
+    TemplateArgument Arg = TemplateArgs(T->getDepth(), T->getIndex());
+    
+    if (T->isParameterPack()) {
+      assert(Arg.getKind() == TemplateArgument::Pack && 
+             "Missing argument pack");
+      
+      if (getSema().ArgumentPackSubstitutionIndex == -1) {
+        // FIXME: Variadic templates fun case.
+        getSema().Diag(TL.getSourceRange().getBegin(), 
+                       diag::err_pack_expansion_mismatch_unsupported);
+        return QualType();
+      }
+      
+      Arg = Arg.pack_begin()[getSema().ArgumentPackSubstitutionIndex];
+    }
+    
+    assert(Arg.getKind() == TemplateArgument::Type &&
            "Template argument kind mismatch");
 
-    QualType Replacement
-      = TemplateArgs(T->getDepth(), T->getIndex()).getAsType();
+    QualType Replacement = Arg.getAsType();
 
     // TODO: only do this uniquing once, at the start of instantiation.
     QualType Result
@@ -990,7 +1037,7 @@ static bool NeedsInstantiationAsFunctionType(TypeSourceInfo *T) {
   if (T->getType()->isDependentType() || T->getType()->isVariablyModifiedType())
     return true;
 
-  TypeLoc TL = T->getTypeLoc();
+  TypeLoc TL = T->getTypeLoc().IgnoreParens();
   if (!isa<FunctionProtoTypeLoc>(TL))
     return false;
 

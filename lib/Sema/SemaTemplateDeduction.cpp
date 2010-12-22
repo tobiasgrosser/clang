@@ -917,6 +917,7 @@ DeduceTemplateArguments(Sema &S,
     return Sema::TDK_Success;
   }
   case TemplateArgument::Pack:
+    // FIXME: Variadic templates
     assert(0 && "FIXME: Implement!");
     break;
   }
@@ -1355,7 +1356,7 @@ getTrivialTemplateArgumentLoc(Sema &S,
     return TemplateArgumentLoc(Arg, Arg.getAsExpr());
 
   case TemplateArgument::Pack:
-    llvm_unreachable("Template parameter packs are not yet supported");
+    return TemplateArgumentLoc(Arg, TemplateArgumentLocInfo());
   }
 
   return TemplateArgumentLoc();
@@ -2813,6 +2814,12 @@ MarkUsedTemplateParameters(Sema &SemaRef, QualType T,
       MarkUsedTemplateParameters(SemaRef,
                                  cast<DecltypeType>(T)->getUnderlyingExpr(),
                                  OnlyDeduced, Depth, Used);
+    break;
+
+  case Type::PackExpansion:
+    MarkUsedTemplateParameters(SemaRef, 
+                               cast<PackExpansionType>(T)->getPattern(),
+                               OnlyDeduced, Depth, Used);
     break;
 
   // None of these types have any template parameters in them.

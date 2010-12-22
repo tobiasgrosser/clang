@@ -1264,16 +1264,16 @@ TemplateDeclInstantiator::VisitCXXMethodDecl(CXXMethodDecl *D,
     return 0;
   QualType T = TInfo->getType();
 
-  // \brief If the type of this function is not *directly* a function
-  // type, then we're instantiating the a function that was declared
-  // via a typedef, e.g.,
+  // \brief If the type of this function, after ignoring parentheses,
+  // is not *directly* a function type, then we're instantiating a function
+  // that was declared via a typedef, e.g.,
   //
   //   typedef int functype(int, int);
   //   functype func;
   //
   // In this case, we'll just go instantiate the ParmVarDecls that we
   // synthesized in the method declaration.
-  if (!isa<FunctionProtoType>(T)) {
+  if (!isa<FunctionProtoType>(T.IgnoreParens())) {
     assert(!Params.size() && "Instantiating type could not yield parameters");
     for (unsigned I = 0, N = D->getNumParams(); I != N; ++I) {
       ParmVarDecl *P = SemaRef.SubstParmVarDecl(D->getParamDecl(I), 
@@ -1983,6 +1983,61 @@ TemplateDeclInstantiator::InitFunctionInstantiation(FunctionDecl *New,
     llvm::SmallVector<QualType, 4> Exceptions;
     for (unsigned I = 0, N = Proto->getNumExceptions(); I != N; ++I) {
       // FIXME: Poor location information!
+      if (const PackExpansionType *PackExpansion
+            = Proto->getExceptionType(I)->getAs<PackExpansionType>()) {
+        // We have a pack expansion. Instantiate it.
+        llvm::SmallVector<UnexpandedParameterPack, 2> Unexpanded;
+        SemaRef.collectUnexpandedParameterPacks(PackExpansion->getPattern(),
+                                                Unexpanded);
+        assert(!Unexpanded.empty() && 
+               "Pack expansion without parameter packs?");
+        
+        bool Expand = false;
+        unsigned NumExpansions = 0;
+        if (SemaRef.CheckParameterPacksForExpansion(New->getLocation(), 
+                                                    SourceRange(),
+                                                    Unexpanded.data(), 
+                                                    Unexpanded.size(),
+                                                    TemplateArgs,
+                                                    Expand, NumExpansions))
+          break;
+                      
+        if (!Expand) {
+          // We can't expand this pack expansion into separate arguments yet;
+          // just substitute into the argument pack.
+          Sema::ArgumentPackSubstitutionIndexRAII SubstIndex(SemaRef, -1);
+          QualType T = SemaRef.SubstType(PackExpansion->getPattern(), 
+                                         TemplateArgs,
+                                       New->getLocation(), New->getDeclName());
+          if (T.isNull())
+            break;
+          
+          Exceptions.push_back(T);
+          continue;
+        }
+        
+        // Substitute into the pack expansion pattern for each template
+        bool Invalid = false;
+        for (unsigned ArgIdx = 0; ArgIdx != NumExpansions; ++ArgIdx) {
+          Sema::ArgumentPackSubstitutionIndexRAII SubstIndex(SemaRef, ArgIdx);
+          
+          QualType T = SemaRef.SubstType(PackExpansion->getPattern(), 
+                                         TemplateArgs,
+                                       New->getLocation(), New->getDeclName());
+          if (T.isNull()) {
+            Invalid = true;
+            break;
+          }
+          
+          Exceptions.push_back(T);
+        }
+        
+        if (Invalid)
+          break;
+        
+        continue;
+      }
+      
       QualType T
         = SemaRef.SubstType(Proto->getExceptionType(I), TemplateArgs,
                             New->getLocation(), New->getDeclName());
@@ -1995,19 +2050,20 @@ TemplateDeclInstantiator::InitFunctionInstantiation(FunctionDecl *New,
 
     // Rebuild the function type 
 
+    FunctionProtoType::ExtProtoInfo EPI = Proto->getExtProtoInfo();
+    EPI.HasExceptionSpec = Proto->hasExceptionSpec();
+    EPI.HasAnyExceptionSpec = Proto->hasAnyExceptionSpec();
+    EPI.NumExceptions = Exceptions.size();
+    EPI.Exceptions = Exceptions.data();
+    EPI.ExtInfo = Proto->getExtInfo();
+
     const FunctionProtoType *NewProto
       = New->getType()->getAs<FunctionProtoType>();
     assert(NewProto && "Template instantiation without function prototype?");
     New->setType(SemaRef.Context.getFunctionType(NewProto->getResultType(),
                                                  NewProto->arg_type_begin(),
                                                  NewProto->getNumArgs(),
-                                                 NewProto->isVariadic(),
-                                                 NewProto->getTypeQuals(),
-                                                 Proto->hasExceptionSpec(),
-                                                 Proto->hasAnyExceptionSpec(),
-                                                 Exceptions.size(),
-                                                 Exceptions.data(),
-                                                 Proto->getExtInfo()));
+                                                 EPI));
   }
 
   SemaRef.InstantiateAttrs(TemplateArgs, Tmpl, New);

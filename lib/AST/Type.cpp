@@ -1097,65 +1097,62 @@ llvm::StringRef FunctionType::getNameForCallConv(CallingConv CC) {
   return "";
 }
 
-FunctionProtoType::FunctionProtoType(QualType Result, const QualType *ArgArray,
-                                     unsigned numArgs, bool isVariadic, 
-                                     unsigned typeQuals, bool hasExs,
-                                     bool hasAnyExs, const QualType *ExArray,
-                                     unsigned numExs, QualType Canonical,
-                                     const ExtInfo &Info)
-  : FunctionType(FunctionProto, Result, isVariadic, typeQuals, Canonical,
-                 Result->isDependentType(),
-                 Result->isVariablyModifiedType(),
-                 Result->containsUnexpandedParameterPack(),
-                 Info),
-    NumArgs(numArgs), NumExceptions(numExs), HasExceptionSpec(hasExs),
-    AnyExceptionSpec(hasAnyExs) 
+FunctionProtoType::FunctionProtoType(QualType result, const QualType *args,
+                                     unsigned numArgs, QualType canonical,
+                                     const ExtProtoInfo &epi)
+  : FunctionType(FunctionProto, result, epi.Variadic, epi.TypeQuals, canonical,
+                 result->isDependentType(),
+                 result->isVariablyModifiedType(),
+                 result->containsUnexpandedParameterPack(),
+                 epi.ExtInfo),
+    NumArgs(numArgs), NumExceptions(epi.NumExceptions),
+    HasExceptionSpec(epi.HasExceptionSpec),
+    HasAnyExceptionSpec(epi.HasAnyExceptionSpec)
 {
   // Fill in the trailing argument array.
-  QualType *ArgInfo = reinterpret_cast<QualType*>(this+1);
+  QualType *argSlot = reinterpret_cast<QualType*>(this+1);
   for (unsigned i = 0; i != numArgs; ++i) {
-    if (ArgArray[i]->isDependentType())
+    if (args[i]->isDependentType())
       setDependent();
 
-    if (ArgArray[i]->containsUnexpandedParameterPack())
+    if (args[i]->containsUnexpandedParameterPack())
       setContainsUnexpandedParameterPack();
 
-    ArgInfo[i] = ArgArray[i];
+    argSlot[i] = args[i];
   }
   
   // Fill in the exception array.
-  QualType *Ex = ArgInfo + numArgs;
-  for (unsigned i = 0; i != numExs; ++i)
-    Ex[i] = ExArray[i];
+  QualType *exnSlot = argSlot + numArgs;
+  for (unsigned i = 0, e = epi.NumExceptions; i != e; ++i) {
+    if (epi.Exceptions[i]->isDependentType())
+      setDependent();
+
+    if (epi.Exceptions[i]->containsUnexpandedParameterPack())
+      setContainsUnexpandedParameterPack();
+
+    exnSlot[i] = epi.Exceptions[i];
+  }
 }
 
 
 void FunctionProtoType::Profile(llvm::FoldingSetNodeID &ID, QualType Result,
-                                arg_type_iterator ArgTys,
-                                unsigned NumArgs, bool isVariadic,
-                                unsigned TypeQuals, bool hasExceptionSpec,
-                                bool anyExceptionSpec, unsigned NumExceptions,
-                                exception_iterator Exs,
-                                FunctionType::ExtInfo Info) {
+                                const QualType *ArgTys, unsigned NumArgs,
+                                const ExtProtoInfo &epi) {
   ID.AddPointer(Result.getAsOpaquePtr());
   for (unsigned i = 0; i != NumArgs; ++i)
     ID.AddPointer(ArgTys[i].getAsOpaquePtr());
-  ID.AddInteger(isVariadic);
-  ID.AddInteger(TypeQuals);
-  ID.AddInteger(hasExceptionSpec);
-  if (hasExceptionSpec) {
-    ID.AddInteger(anyExceptionSpec);
-    for (unsigned i = 0; i != NumExceptions; ++i)
-      ID.AddPointer(Exs[i].getAsOpaquePtr());
+  ID.AddBoolean(epi.Variadic);
+  ID.AddInteger(epi.TypeQuals);
+  if (epi.HasExceptionSpec) {
+    ID.AddBoolean(epi.HasAnyExceptionSpec);
+    for (unsigned i = 0; i != epi.NumExceptions; ++i)
+      ID.AddPointer(epi.Exceptions[i].getAsOpaquePtr());
   }
-  Info.Profile(ID);
+  epi.ExtInfo.Profile(ID);
 }
 
 void FunctionProtoType::Profile(llvm::FoldingSetNodeID &ID) {
-  Profile(ID, getResultType(), arg_type_begin(), NumArgs, isVariadic(),
-          getTypeQuals(), hasExceptionSpec(), hasAnyExceptionSpec(),
-          getNumExceptions(), exception_begin(),
-          getExtInfo());
+  Profile(ID, getResultType(), arg_type_begin(), NumArgs, getExtProtoInfo());
 }
 
 QualType TypedefType::desugar() const {
@@ -1230,45 +1227,6 @@ bool EnumType::classof(const TagType *TT) {
   return isa<EnumDecl>(TT->getDecl());
 }
 
-static bool isDependent(const TemplateArgument &Arg) {
-  switch (Arg.getKind()) {
-  case TemplateArgument::Null:
-    assert(false && "Should not have a NULL template argument");
-    return false;
-
-  case TemplateArgument::Type:
-    return Arg.getAsType()->isDependentType();
-
-  case TemplateArgument::Template:
-    return Arg.getAsTemplate().isDependent();
-      
-  case TemplateArgument::Declaration:
-    if (DeclContext *DC = dyn_cast<DeclContext>(Arg.getAsDecl()))
-      return DC->isDependentContext();
-    return Arg.getAsDecl()->getDeclContext()->isDependentContext();
-
-  case TemplateArgument::Integral:
-    // Never dependent
-    return false;
-
-  case TemplateArgument::Expression:
-    return (Arg.getAsExpr()->isTypeDependent() ||
-            Arg.getAsExpr()->isValueDependent());
-
-  case TemplateArgument::Pack:
-    for (TemplateArgument::pack_iterator P = Arg.pack_begin(), 
-                                      PEnd = Arg.pack_end();
-         P != PEnd; ++P) {
-      if (isDependent(*P))
-        return true;
-    }
-
-    return false;
-  }
-
-  return false;
-}
-
 bool TemplateSpecializationType::
 anyDependentTemplateArguments(const TemplateArgumentListInfo &Args) {
   return anyDependentTemplateArguments(Args.getArgumentArray(), Args.size());
@@ -1277,7 +1235,7 @@ anyDependentTemplateArguments(const TemplateArgumentListInfo &Args) {
 bool TemplateSpecializationType::
 anyDependentTemplateArguments(const TemplateArgumentLoc *Args, unsigned N) {
   for (unsigned i = 0; i != N; ++i)
-    if (isDependent(Args[i].getArgument()))
+    if (Args[i].getArgument().isDependent())
       return true;
   return false;
 }
@@ -1285,7 +1243,7 @@ anyDependentTemplateArguments(const TemplateArgumentLoc *Args, unsigned N) {
 bool TemplateSpecializationType::
 anyDependentTemplateArguments(const TemplateArgument *Args, unsigned N) {
   for (unsigned i = 0; i != N; ++i)
-    if (isDependent(Args[i]))
+    if (Args[i].isDependent())
       return true;
   return false;
 }
@@ -1308,7 +1266,7 @@ TemplateSpecializationType(TemplateName T,
     = reinterpret_cast<TemplateArgument *>(this + 1);
   for (unsigned Arg = 0; Arg < NumArgs; ++Arg) {
     // Update dependent and variably-modified bits.
-    if (isDependent(Args[Arg]))
+    if (Args[Arg].isDependent())
       setDependent();
     if (Args[Arg].getKind() == TemplateArgument::Type &&
         Args[Arg].getAsType()->isVariablyModifiedType())

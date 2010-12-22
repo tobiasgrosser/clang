@@ -177,6 +177,12 @@ Sema::ActOnParamDefaultArgument(Decl *param, SourceLocation EqualLoc,
     return;
   }
 
+  // Check for unexpanded parameter packs.
+  if (DiagnoseUnexpandedParameterPack(DefaultArg, UPPC_DefaultArgument)) {
+    Param->setInvalidDecl();
+    return;
+  }    
+      
   // Check that the default argument is well-formed
   CheckDefaultArgumentVisitor DefaultArgChecker(DefaultArg, this);
   if (DefaultArgChecker.Visit(DefaultArg)) {
@@ -928,6 +934,7 @@ Sema::ActOnCXXMemberDeclarator(Scope *S, AccessSpecifier AS, Declarator &D,
     }
     
     // FIXME: Check for template parameters!
+    // FIXME: Check that the name is an identifier!
     Member = HandleField(S, cast<CXXRecordDecl>(CurContext), Loc, D, BitWidth,
                          AS);
     assert(Member && "HandleField never returns null");
@@ -1991,8 +1998,19 @@ DiagnoseBaseOrMemInitializerOrder(Sema &SemaRef,
   if (Constructor->getDeclContext()->isDependentContext())
     return;
 
-  if (SemaRef.Diags.getDiagnosticLevel(diag::warn_initializer_out_of_order)
-        == Diagnostic::Ignored)
+  // Don't check initializers order unless the warning is enabled at the
+  // location of at least one initializer. 
+  bool ShouldCheckOrder = false;
+  for (unsigned InitIndex = 0; InitIndex != NumInits; ++InitIndex) {
+    CXXBaseOrMemberInitializer *Init = Inits[InitIndex];
+    if (SemaRef.Diags.getDiagnosticLevel(diag::warn_initializer_out_of_order,
+                                         Init->getSourceLocation())
+          != Diagnostic::Ignored) {
+      ShouldCheckOrder = true;
+      break;
+    }
+  }
+  if (!ShouldCheckOrder)
     return;
   
   // Build the list of bases and members in the order that they'll
@@ -2851,20 +2869,21 @@ QualType Sema::CheckConstructorDeclarator(Declarator &D, QualType R,
     if (FTI.TypeQuals & Qualifiers::Restrict)
       Diag(D.getIdentifierLoc(), diag::err_invalid_qualified_constructor)
         << "restrict" << SourceRange(D.getIdentifierLoc());
+    D.setInvalidType();
   }
 
   // Rebuild the function type "R" without any type qualifiers (in
   // case any of the errors above fired) and with "void" as the
   // return type, since constructors don't have return types.
   const FunctionProtoType *Proto = R->getAs<FunctionProtoType>();
+  if (Proto->getResultType() == Context.VoidTy && !D.isInvalidType())
+    return R;
+
+  FunctionProtoType::ExtProtoInfo EPI = Proto->getExtProtoInfo();
+  EPI.TypeQuals = 0;
+
   return Context.getFunctionType(Context.VoidTy, Proto->arg_type_begin(),
-                                 Proto->getNumArgs(),
-                                 Proto->isVariadic(), 0,
-                                 Proto->hasExceptionSpec(),
-                                 Proto->hasAnyExceptionSpec(),
-                                 Proto->getNumExceptions(),
-                                 Proto->exception_begin(),
-                                 Proto->getExtInfo());
+                                 Proto->getNumArgs(), EPI);
 }
 
 /// CheckConstructor - Checks a fully-formed constructor for
@@ -3022,16 +3041,14 @@ QualType Sema::CheckDestructorDeclarator(Declarator &D, QualType R,
   // parameters (in case any of the errors above fired) and with
   // "void" as the return type, since destructors don't have return
   // types. 
+  if (!D.isInvalidType())
+    return R;
+
   const FunctionProtoType *Proto = R->getAs<FunctionProtoType>();
-  if (!Proto)
-    return QualType();
-  
-  return Context.getFunctionType(Context.VoidTy, 0, 0, false, 0,
-                                 Proto->hasExceptionSpec(),
-                                 Proto->hasAnyExceptionSpec(),
-                                 Proto->getNumExceptions(),
-                                 Proto->exception_begin(),
-                                 Proto->getExtInfo());
+  FunctionProtoType::ExtProtoInfo EPI = Proto->getExtProtoInfo();
+  EPI.Variadic = false;
+  EPI.TypeQuals = 0;
+  return Context.getFunctionType(Context.VoidTy, 0, 0, EPI);
 }
 
 /// CheckConversionDeclarator - Called by ActOnDeclarator to check the
@@ -3111,15 +3128,8 @@ void Sema::CheckConversionDeclarator(Declarator &D, QualType &R,
   // Rebuild the function type "R" without any parameters (in case any
   // of the errors above fired) and with the conversion type as the
   // return type.
-  if (D.isInvalidType()) {
-    R = Context.getFunctionType(ConvType, 0, 0, false,
-                                Proto->getTypeQuals(),
-                                Proto->hasExceptionSpec(),
-                                Proto->hasAnyExceptionSpec(),
-                                Proto->getNumExceptions(),
-                                Proto->exception_begin(),
-                                Proto->getExtInfo());
-  }
+  if (D.isInvalidType())
+    R = Context.getFunctionType(ConvType, 0, 0, Proto->getExtProtoInfo());
 
   // C++0x explicit conversion operators.
   if (D.getDeclSpec().isExplicitSpecified() && !getLangOptions().CPlusPlus0x)
@@ -3543,6 +3553,10 @@ Decl *Sema::ActOnUsingDeclaration(Scope *S,
     Diag(UsingLoc, diag::warn_access_decl_deprecated)
       << FixItHint::CreateInsertion(SS.getRange().getBegin(), "using ");
   }
+
+  if (DiagnoseUnexpandedParameterPack(SS, UPPC_UsingDeclaration) ||
+      DiagnoseUnexpandedParameterPack(TargetNameInfo, UPPC_UsingDeclaration))
+    return 0;
 
   NamedDecl *UD = BuildUsingDeclaration(S, AS, UsingLoc, SS,
                                         TargetNameInfo, AttrList,
@@ -4038,6 +4052,10 @@ bool Sema::CheckUsingDeclQualifier(SourceLocation UsingLoc,
     return true;
   }
 
+  if (!NamedContext->isDependentContext() &&
+      RequireCompleteDeclContext(const_cast<CXXScopeSpec&>(SS), NamedContext))
+    return true;
+
   if (getLangOptions().CPlusPlus0x) {
     // C++0x [namespace.udecl]p3:
     //   In a using-declaration used as a member-declaration, the
@@ -4310,7 +4328,12 @@ CXXConstructorDecl *Sema::DeclareImplicitDefaultConstructor(
         ExceptSpec.CalledDecl(Constructor);
     }
   }
-  
+
+  FunctionProtoType::ExtProtoInfo EPI;
+  EPI.HasExceptionSpec = ExceptSpec.hasExceptionSpecification();
+  EPI.HasAnyExceptionSpec = ExceptSpec.hasAnyExceptionSpecification();
+  EPI.NumExceptions = ExceptSpec.size();
+  EPI.Exceptions = ExceptSpec.data();
   
   // Create the actual constructor declaration.
   CanQualType ClassType
@@ -4321,12 +4344,7 @@ CXXConstructorDecl *Sema::DeclareImplicitDefaultConstructor(
   CXXConstructorDecl *DefaultCon
     = CXXConstructorDecl::Create(Context, ClassDecl, NameInfo,
                                  Context.getFunctionType(Context.VoidTy,
-                                                         0, 0, false, 0,
-                                       ExceptSpec.hasExceptionSpecification(),
-                                     ExceptSpec.hasAnyExceptionSpecification(),
-                                                         ExceptSpec.size(),
-                                                         ExceptSpec.data(),
-                                                       FunctionType::ExtInfo()),
+                                                         0, 0, EPI),
                                  /*TInfo=*/0,
                                  /*isExplicit=*/false,
                                  /*isInline=*/true,
@@ -4414,13 +4432,12 @@ CXXDestructorDecl *Sema::DeclareImplicitDestructor(CXXRecordDecl *ClassDecl) {
   }
   
   // Create the actual destructor declaration.
-  QualType Ty = Context.getFunctionType(Context.VoidTy,
-                                        0, 0, false, 0,
-                                        ExceptSpec.hasExceptionSpecification(),
-                                    ExceptSpec.hasAnyExceptionSpecification(),
-                                        ExceptSpec.size(),
-                                        ExceptSpec.data(),
-                                        FunctionType::ExtInfo());
+  FunctionProtoType::ExtProtoInfo EPI;
+  EPI.HasExceptionSpec = ExceptSpec.hasExceptionSpecification();
+  EPI.HasAnyExceptionSpec = ExceptSpec.hasAnyExceptionSpecification();
+  EPI.NumExceptions = ExceptSpec.size();
+  EPI.Exceptions = ExceptSpec.data();
+  QualType Ty = Context.getFunctionType(Context.VoidTy, 0, 0, EPI);
   
   CanQualType ClassType
     = Context.getCanonicalType(Context.getTypeDeclType(ClassDecl));
@@ -4812,17 +4829,16 @@ CXXMethodDecl *Sema::DeclareImplicitCopyAssignment(CXXRecordDecl *ClassDecl) {
   
   //   An implicitly-declared copy assignment operator is an inline public
   //   member of its class.
+  FunctionProtoType::ExtProtoInfo EPI;
+  EPI.HasExceptionSpec = ExceptSpec.hasExceptionSpecification();
+  EPI.HasAnyExceptionSpec = ExceptSpec.hasAnyExceptionSpecification();
+  EPI.NumExceptions = ExceptSpec.size();
+  EPI.Exceptions = ExceptSpec.data();
   DeclarationName Name = Context.DeclarationNames.getCXXOperatorName(OO_Equal);
   DeclarationNameInfo NameInfo(Name, ClassDecl->getLocation());
   CXXMethodDecl *CopyAssignment
     = CXXMethodDecl::Create(Context, ClassDecl, NameInfo,
-                            Context.getFunctionType(RetType, &ArgType, 1,
-                                                    false, 0,
-                                         ExceptSpec.hasExceptionSpecification(),
-                                      ExceptSpec.hasAnyExceptionSpecification(),
-                                                    ExceptSpec.size(),
-                                                    ExceptSpec.data(),
-                                                    FunctionType::ExtInfo()),
+                            Context.getFunctionType(RetType, &ArgType, 1, EPI),
                             /*TInfo=*/0, /*isStatic=*/false,
                             /*StorageClassAsWritten=*/SC_None,
                             /*isInline=*/true);
@@ -5278,6 +5294,11 @@ CXXConstructorDecl *Sema::DeclareImplicitCopyConstructor(
   
   //   An implicitly-declared copy constructor is an inline public
   //   member of its class.
+  FunctionProtoType::ExtProtoInfo EPI;
+  EPI.HasExceptionSpec = ExceptSpec.hasExceptionSpecification();
+  EPI.HasAnyExceptionSpec = ExceptSpec.hasAnyExceptionSpecification();
+  EPI.NumExceptions = ExceptSpec.size();
+  EPI.Exceptions = ExceptSpec.data();
   DeclarationName Name
     = Context.DeclarationNames.getCXXConstructorName(
                                            Context.getCanonicalType(ClassType));
@@ -5285,13 +5306,7 @@ CXXConstructorDecl *Sema::DeclareImplicitCopyConstructor(
   CXXConstructorDecl *CopyConstructor
     = CXXConstructorDecl::Create(Context, ClassDecl, NameInfo,
                                  Context.getFunctionType(Context.VoidTy,
-                                                         &ArgType, 1,
-                                                         false, 0,
-                                         ExceptSpec.hasExceptionSpecification(),
-                                      ExceptSpec.hasAnyExceptionSpecification(),
-                                                         ExceptSpec.size(),
-                                                         ExceptSpec.data(),
-                                                       FunctionType::ExtInfo()),
+                                                         &ArgType, 1, EPI),
                                  /*TInfo=*/0,
                                  /*isExplicit=*/false,
                                  /*isInline=*/true,
@@ -5512,11 +5527,21 @@ void Sema::AddCXXDirectInitializerToDecl(Decl *RealDecl,
     return;
   } 
 
+  bool IsDependent = false;
+  for (unsigned I = 0, N = Exprs.size(); I != N; ++I) {
+    if (DiagnoseUnexpandedParameterPack(Exprs.get()[I], UPPC_Expression)) {
+      VDecl->setInvalidDecl();
+      return;
+    }
+
+    if (Exprs.get()[I]->isTypeDependent())
+      IsDependent = true;
+  }
+
   // If either the declaration has a dependent type or if any of the
   // expressions is type-dependent, we represent the initialization
   // via a ParenListExpr for later use during template instantiation.
-  if (VDecl->getType()->isDependentType() ||
-      Expr::hasAnyTypeDependentArguments((Expr **)Exprs.get(), Exprs.size())) {
+  if (VDecl->getType()->isDependentType() || IsDependent) {
     // Let clients know that initialization was done with a direct initializer.
     VDecl->setCXXDirectInitializer(true);
 
@@ -6117,9 +6142,18 @@ VarDecl *Sema::BuildExceptionDeclaration(Scope *S,
 /// handler.
 Decl *Sema::ActOnExceptionDeclarator(Scope *S, Declarator &D) {
   TypeSourceInfo *TInfo = GetTypeForDeclarator(D, S);
+  bool Invalid = D.isInvalidType();
+
+  // Check for unexpanded parameter packs.
+  if (TInfo && DiagnoseUnexpandedParameterPack(D.getIdentifierLoc(), TInfo,
+                                               UPPC_ExceptionType)) {
+    TInfo = Context.getTrivialTypeSourceInfo(Context.IntTy, 
+                                             D.getIdentifierLoc());
+    Invalid = true;
+  }
+
   QualType ExDeclType = TInfo->getType();
 
-  bool Invalid = D.isInvalidType();
   IdentifierInfo *II = D.getIdentifier();
   if (NamedDecl *PrevDecl = LookupSingleName(S, II, D.getIdentifierLoc(),
                                              LookupOrdinaryName,
@@ -6174,6 +6208,9 @@ Decl *Sema::ActOnStaticAssertDeclaration(SourceLocation AssertLoc,
         << AssertMessage->getString() << AssertExpr->getSourceRange();
     }
   }
+
+  if (DiagnoseUnexpandedParameterPack(AssertExpr, UPPC_StaticAssertExpression))
+    return 0;
 
   Decl *Decl = StaticAssertDecl::Create(Context, CurContext, AssertLoc,
                                         AssertExpr, AssertMessage);
@@ -6375,6 +6412,9 @@ Decl *Sema::ActOnFriendTypeDecl(Scope *S, const DeclSpec &DS,
   if (TheDeclarator.isInvalidType())
     return 0;
 
+  if (DiagnoseUnexpandedParameterPack(Loc, TSI, UPPC_FriendDeclaration))
+    return 0;
+
   // This is definitely an error in C++98.  It's probably meant to
   // be forbidden in C++0x, too, but the specification is just
   // poorly written.
@@ -6473,6 +6513,12 @@ Decl *Sema::ActOnFriendFunctionDecl(Scope *S, Declarator &D, bool IsDefinition,
   DeclarationNameInfo NameInfo = GetNameForDeclarator(D);
   DeclarationName Name = NameInfo.getName();
   assert(Name);
+
+  // Check for unexpanded parameter packs.
+  if (DiagnoseUnexpandedParameterPack(Loc, TInfo, UPPC_FriendDeclaration) ||
+      DiagnoseUnexpandedParameterPack(NameInfo, UPPC_FriendDeclaration) ||
+      DiagnoseUnexpandedParameterPack(SS, UPPC_FriendDeclaration))
+    return 0;
 
   // The context we found the declaration in, or in which we should
   // create the declaration.

@@ -809,7 +809,7 @@ NamedDecl *Sema::LazilyCreateBuiltin(IdentifierInfo *II, unsigned bid,
       << Context.BuiltinInfo.GetName(BID)
       << R;
     if (Context.BuiltinInfo.getHeaderName(BID) &&
-        Diags.getDiagnosticLevel(diag::ext_implicit_lib_function_decl)
+        Diags.getDiagnosticLevel(diag::ext_implicit_lib_function_decl, Loc)
           != Diagnostic::Ignored)
       Diag(Loc, diag::note_please_include_header)
         << Context.BuiltinInfo.getHeaderName(BID)
@@ -1140,15 +1140,15 @@ bool Sema::MergeFunctionDecl(FunctionDecl *New, Decl *OldD) {
   //
   // Note also that we DO NOT return at this point, because we still have
   // other tests to run.
-  const FunctionType *OldType = OldQType->getAs<FunctionType>();
+  const FunctionType *OldType = cast<FunctionType>(OldQType);
   const FunctionType *NewType = New->getType()->getAs<FunctionType>();
-  const FunctionType::ExtInfo OldTypeInfo = OldType->getExtInfo();
-  const FunctionType::ExtInfo NewTypeInfo = NewType->getExtInfo();
+  FunctionType::ExtInfo OldTypeInfo = OldType->getExtInfo();
+  FunctionType::ExtInfo NewTypeInfo = NewType->getExtInfo();
+  bool RequiresAdjustment = false;
   if (OldTypeInfo.getCC() != CC_Default &&
       NewTypeInfo.getCC() == CC_Default) {
-    NewQType = Context.getCallConvType(NewQType, OldTypeInfo.getCC());
-    New->setType(NewQType);
-    NewQType = Context.getCanonicalType(NewQType);
+    NewTypeInfo = NewTypeInfo.withCallingConv(OldTypeInfo.getCC());
+    RequiresAdjustment = true;
   } else if (!Context.isSameCallConv(OldTypeInfo.getCC(),
                                      NewTypeInfo.getCC())) {
     // Calling conventions really aren't compatible, so complain.
@@ -1162,25 +1162,29 @@ bool Sema::MergeFunctionDecl(FunctionDecl *New, Decl *OldD) {
   }
 
   // FIXME: diagnose the other way around?
-  if (OldType->getNoReturnAttr() && !NewType->getNoReturnAttr()) {
-    NewQType = Context.getNoReturnType(NewQType);
-    New->setType(NewQType);
-    assert(NewQType.isCanonical());
+  if (OldTypeInfo.getNoReturn() && !NewTypeInfo.getNoReturn()) {
+    NewTypeInfo = NewTypeInfo.withNoReturn(true);
+    RequiresAdjustment = true;
   }
 
   // Merge regparm attribute.
-  if (OldType->getRegParmType() != NewType->getRegParmType()) {
-    if (NewType->getRegParmType()) {
+  if (OldTypeInfo.getRegParm() != NewTypeInfo.getRegParm()) {
+    if (NewTypeInfo.getRegParm()) {
       Diag(New->getLocation(), diag::err_regparm_mismatch)
         << NewType->getRegParmType()
         << OldType->getRegParmType();
       Diag(Old->getLocation(), diag::note_previous_declaration);      
       return true;
     }
-    
-    NewQType = Context.getRegParmType(NewQType, OldType->getRegParmType());
-    New->setType(NewQType);
-    assert(NewQType.isCanonical());    
+
+    NewTypeInfo = NewTypeInfo.withRegParm(OldTypeInfo.getRegParm());
+    RequiresAdjustment = true;
+  }
+
+  if (RequiresAdjustment) {
+    NewType = Context.adjustFunctionType(NewType, NewTypeInfo);
+    New->setType(QualType(NewType, 0));
+    NewQType = Context.getCanonicalType(New->getType());
   }
   
   if (getLangOptions().CPlusPlus) {
@@ -1188,10 +1192,8 @@ bool Sema::MergeFunctionDecl(FunctionDecl *New, Decl *OldD) {
     //   Certain function declarations cannot be overloaded:
     //     -- Function declarations that differ only in the return type
     //        cannot be overloaded.
-    QualType OldReturnType
-      = cast<FunctionType>(OldQType.getTypePtr())->getResultType();
-    QualType NewReturnType
-      = cast<FunctionType>(NewQType.getTypePtr())->getResultType();
+    QualType OldReturnType = OldType->getResultType();
+    QualType NewReturnType = cast<FunctionType>(NewQType)->getResultType();
     QualType ResQT;
     if (OldReturnType != NewReturnType) {
       if (NewReturnType->isObjCObjectPointerType()
@@ -1261,9 +1263,19 @@ bool Sema::MergeFunctionDecl(FunctionDecl *New, Decl *OldD) {
     // (C++98 8.3.5p3):
     //   All declarations for a function shall agree exactly in both the
     //   return type and the parameter-type-list.
-    // attributes should be ignored when comparing.
-    if (Context.getNoReturnType(OldQType, false) ==
-        Context.getNoReturnType(NewQType, false))
+    // We also want to respect all the extended bits except noreturn.
+
+    // noreturn should now match unless the old type info didn't have it.
+    QualType OldQTypeForComparison = OldQType;
+    if (!OldTypeInfo.getNoReturn() && NewTypeInfo.getNoReturn()) {
+      assert(OldQType == QualType(OldType, 0));
+      const FunctionType *OldTypeForComparison
+        = Context.adjustFunctionType(OldType, OldTypeInfo.withNoReturn(true));
+      OldQTypeForComparison = QualType(OldTypeForComparison, 0);
+      assert(OldQTypeForComparison.isCanonical());
+    }
+
+    if (OldQTypeForComparison == NewQType)
       return MergeCompatibleFunctionDecls(New, Old);
 
     // Fall through for conflicting redeclarations and redefinitions.
@@ -1285,10 +1297,7 @@ bool Sema::MergeFunctionDecl(FunctionDecl *New, Decl *OldD) {
                                                  OldProto->arg_type_end());
       NewQType = Context.getFunctionType(NewFuncType->getResultType(),
                                          ParamTypes.data(), ParamTypes.size(),
-                                         OldProto->isVariadic(),
-                                         OldProto->getTypeQuals(),
-                                         false, false, 0, 0,
-                                         OldProto->getExtInfo());
+                                         OldProto->getExtProtoInfo());
       New->setType(NewQType);
       New->setHasInheritedPrototype();
 
@@ -1370,9 +1379,7 @@ bool Sema::MergeFunctionDecl(FunctionDecl *New, Decl *OldD) {
 
       New->setType(Context.getFunctionType(MergedReturn, &ArgTypes[0],
                                            ArgTypes.size(),
-                                           OldProto->isVariadic(), 0,
-                                           false, false, 0, 0,
-                                           OldProto->getExtInfo()));
+                                           OldProto->getExtProtoInfo()));
       return MergeCompatibleFunctionDecls(New, Old);
     }
 
@@ -2324,7 +2331,8 @@ Decl *Sema::HandleDeclarator(Scope *S, Declarator &D,
            diag::err_declarator_need_ident)
         << D.getDeclSpec().getSourceRange() << D.getSourceRange();
     return 0;
-  }
+  } else if (DiagnoseUnexpandedParameterPack(NameInfo, UPPC_DeclarationType))
+    return 0;
 
   // The scope passed in may not be a decl scope.  Zip up the scope tree until
   // we find one that is.
@@ -2336,6 +2344,10 @@ Decl *Sema::HandleDeclarator(Scope *S, Declarator &D,
   if (D.getCXXScopeSpec().isInvalid())
     D.setInvalidType();
   else if (D.getCXXScopeSpec().isSet()) {
+    if (DiagnoseUnexpandedParameterPack(D.getCXXScopeSpec(), 
+                                        UPPC_DeclarationQualifier))
+      return 0;
+
     bool EnteringContext = !D.getDeclSpec().isFriendSpecified();
     DC = computeDeclContext(D.getCXXScopeSpec(), EnteringContext);
     if (!DC) {
@@ -3086,7 +3098,8 @@ Sema::ActOnVariableDeclarator(Scope *S, Declarator &D, DeclContext *DC,
 ///
 void Sema::CheckShadow(Scope *S, VarDecl *D, const LookupResult& R) {
   // Return if warning is ignored.
-  if (Diags.getDiagnosticLevel(diag::warn_decl_shadow) == Diagnostic::Ignored)
+  if (Diags.getDiagnosticLevel(diag::warn_decl_shadow, R.getNameLoc()) ==
+        Diagnostic::Ignored)
     return;
 
   // Don't diagnose declarations at file scope.  The scope might not
@@ -3140,6 +3153,10 @@ void Sema::CheckShadow(Scope *S, VarDecl *D, const LookupResult& R) {
 
 /// \brief Check -Wshadow without the advantage of a previous lookup.
 void Sema::CheckShadow(Scope *S, VarDecl *D) {
+  if (Diags.getDiagnosticLevel(diag::warn_decl_shadow, D->getLocation()) ==
+        Diagnostic::Ignored)
+    return;
+
   LookupResult R(*this, D->getDeclName(), D->getLocation(),
                  Sema::LookupOrdinaryName, Sema::ForRedeclaration);
   LookupName(R, S);
@@ -3740,6 +3757,12 @@ Sema::ActOnFunctionDeclarator(Scope* S, Declarator& D, DeclContext* DC,
       NewFD->setAccess(AS_public);
     }
 
+    if (isa<CXXMethodDecl>(NewFD) && DC == CurContext && IsFunctionDefinition) {
+      // A method is implicitly inline if it's defined in its class
+      // definition.
+      NewFD->setImplicitlyInline();
+    }
+
     if (SC == SC_Static && isa<CXXMethodDecl>(NewFD) &&
         !CurContext->isRecord()) {
       // C++ [class.static]p1:
@@ -3766,7 +3789,7 @@ Sema::ActOnFunctionDeclarator(Scope* S, Declarator& D, DeclContext* DC,
   // Copy the parameter declarations from the declarator D to the function
   // declaration NewFD, if they are available.  First scavenge them into Params.
   llvm::SmallVector<ParmVarDecl*, 16> Params;
-  if (D.getNumTypeObjects() > 0) {
+  if (D.isFunctionDeclarator()) {
     DeclaratorChunk::FunctionTypeInfo &FTI = D.getFunctionTypeInfo();
 
     // Check for C99 6.7.5.3p10 - foo(void) is a non-varargs
@@ -4046,9 +4069,11 @@ Sema::ActOnFunctionDeclarator(Scope* S, Declarator& D, DeclContext* DC,
 
     // Turn this into a variadic function with no parameters.
     const FunctionType *FT = NewFD->getType()->getAs<FunctionType>();
-    QualType R = Context.getFunctionType(FT->getResultType(),
-                                         0, 0, true, 0, false, false, 0, 0,
-                                         FT->getExtInfo());
+    FunctionProtoType::ExtProtoInfo EPI;
+    EPI.Variadic = true;
+    EPI.ExtInfo = FT->getExtInfo();
+
+    QualType R = Context.getFunctionType(FT->getResultType(), 0, 0, EPI);
     NewFD->setType(R);
   }
 
@@ -4260,6 +4285,18 @@ void Sema::CheckFunctionDeclaration(Scope *S, FunctionDecl *NewFD,
     // during delayed parsing anyway.
     if (!CurContext->isRecord())
       CheckCXXDefaultArguments(NewFD);
+    
+    // If this function declares a builtin function, check the type of this
+    // declaration against the expected type for the builtin. 
+    if (unsigned BuiltinID = NewFD->getBuiltinID()) {
+      ASTContext::GetBuiltinTypeError Error;
+      QualType T = Context.GetBuiltinType(BuiltinID, Error);
+      if (!T.isNull() && !Context.hasSameType(T, NewFD->getType())) {
+        // The type of this function differs from the type of the builtin,
+        // so forget about the builtin entirely.
+        Context.BuiltinInfo.ForgetBuiltin(BuiltinID, Context.Idents);
+      }
+    }
   }
 }
 
@@ -4286,7 +4323,7 @@ void Sema::CheckMain(FunctionDecl* FD) {
 
   if (!Context.hasSameUnqualifiedType(FT->getResultType(), Context.IntTy)) {
     TypeSourceInfo *TSI = FD->getTypeSourceInfo();
-    TypeLoc TL = TSI->getTypeLoc();
+    TypeLoc TL = TSI->getTypeLoc().IgnoreParens();
     const SemaDiagnosticBuilder& D = Diag(FD->getTypeSpecStartLoc(),
                                           diag::err_main_returns_nonint);
     if (FunctionTypeLoc* PTL = dyn_cast<FunctionTypeLoc>(&TL)) {
@@ -4451,27 +4488,34 @@ void Sema::AddInitializerToDecl(Decl *RealDecl, Expr *Init, bool DirectInit) {
     return;
   }
   
-  // C++ [class.static.data]p4
-  //   If a static data member is of const integral or const
-  //   enumeration type, its declaration in the class definition can
-  //   specify a constant-initializer which shall be an integral
-  //   constant expression (5.19). In that case, the member can appear
-  //   in integral constant expressions. The member shall still be
-  //   defined in a namespace scope if it is used in the program and the
-  //   namespace scope definition shall not contain an initializer.
-  //
-  // We already performed a redefinition check above, but for static
-  // data members we also need to check whether there was an in-class
-  // declaration with an initializer.
   const VarDecl* PrevInit = 0;
-  if (VDecl->isStaticDataMember() && VDecl->getAnyInitializer(PrevInit)) {
-    Diag(VDecl->getLocation(), diag::err_redefinition) << VDecl->getDeclName();
-    Diag(PrevInit->getLocation(), diag::note_previous_definition);
-    return;
-  }  
+  if (getLangOptions().CPlusPlus) {
+    // C++ [class.static.data]p4
+    //   If a static data member is of const integral or const
+    //   enumeration type, its declaration in the class definition can
+    //   specify a constant-initializer which shall be an integral
+    //   constant expression (5.19). In that case, the member can appear
+    //   in integral constant expressions. The member shall still be
+    //   defined in a namespace scope if it is used in the program and the
+    //   namespace scope definition shall not contain an initializer.
+    //
+    // We already performed a redefinition check above, but for static
+    // data members we also need to check whether there was an in-class
+    // declaration with an initializer.
+    if (VDecl->isStaticDataMember() && VDecl->getAnyInitializer(PrevInit)) {
+      Diag(VDecl->getLocation(), diag::err_redefinition) << VDecl->getDeclName();
+      Diag(PrevInit->getLocation(), diag::note_previous_definition);
+      return;
+    }  
 
-  if (getLangOptions().CPlusPlus && VDecl->hasLocalStorage())
-    getCurFunction()->setHasBranchProtectedScope();
+    if (VDecl->hasLocalStorage())
+      getCurFunction()->setHasBranchProtectedScope();
+
+    if (DiagnoseUnexpandedParameterPack(Init, UPPC_Initializer)) {
+      VDecl->setInvalidDecl();
+      return;
+    }
+  }
 
   // Capture the variable that is being initialized and the style of
   // initialization.
@@ -5011,10 +5055,6 @@ ParmVarDecl *Sema::BuildParmVarDeclForTypedef(DeclContext *DC,
 
 void Sema::DiagnoseUnusedParameters(ParmVarDecl * const *Param,
                                     ParmVarDecl * const *ParamEnd) {
-  if (Diags.getDiagnosticLevel(diag::warn_unused_parameter) ==
-        Diagnostic::Ignored)
-    return;
-
   // Don't diagnose unused-parameter errors in template instantiations; we
   // will already have done so in the template itself.
   if (!ActiveTemplateInstantiations.empty())
@@ -5044,9 +5084,6 @@ void Sema::DiagnoseSizeOfParametersAndReturnValue(ParmVarDecl * const *Param,
       Diag(D->getLocation(), diag::warn_return_value_size)
           << D->getDeclName() << Size;
   }
-
-  if (Diags.getDiagnosticLevel(diag::warn_parameter_size)==Diagnostic::Ignored)
-    return;
 
   // Warn if any parameter is pass-by-value and larger than the specified
   // threshold.
@@ -5252,9 +5289,6 @@ Decl *Sema::ActOnStartOfFunctionDef(Scope *FnBodyScope, Decl *D) {
   CheckParmsForFunctionDef(FD->param_begin(), FD->param_end(),
                            /*CheckParameterNames=*/true);
 
-  bool ShouldCheckShadow =
-    Diags.getDiagnosticLevel(diag::warn_decl_shadow) != Diagnostic::Ignored;
-
   // Introduce our parameters into the function scope
   for (unsigned p = 0, NumParams = FD->getNumParams(); p < NumParams; ++p) {
     ParmVarDecl *Param = FD->getParamDecl(p);
@@ -5262,8 +5296,7 @@ Decl *Sema::ActOnStartOfFunctionDef(Scope *FnBodyScope, Decl *D) {
 
     // If this has an identifier, add it to the scope stack.
     if (Param->getIdentifier() && FnBodyScope) {
-      if (ShouldCheckShadow)
-        CheckShadow(FnBodyScope, Param);
+      CheckShadow(FnBodyScope, Param);
 
       PushOnScopeChains(Param, FnBodyScope);
     }
@@ -5573,8 +5606,6 @@ void Sema::AddKnownFunctionAttributes(FunctionDecl *FD) {
         FD->addAttr(::new (Context) ConstAttr(FD->getLocation(), Context));
     }
 
-    if (Context.BuiltinInfo.isNoReturn(BuiltinID))
-      FD->setType(Context.getNoReturnType(FD->getType()));
     if (Context.BuiltinInfo.isNoThrow(BuiltinID))
       FD->addAttr(::new (Context) NoThrowAttr(FD->getLocation(), Context));
     if (Context.BuiltinInfo.isConst(BuiltinID))
@@ -5774,6 +5805,11 @@ Decl *Sema::ActOnTag(Scope *S, unsigned TagSpec, TagUseKind TUK,
         // Recover by falling back to int.
         EnumUnderlying = Context.IntTy.getTypePtr();
       }
+
+      if (DiagnoseUnexpandedParameterPack(UnderlyingLoc, TI, 
+                                          UPPC_FixedUnderlyingType))
+        EnumUnderlying = Context.IntTy.getTypePtr();
+
     } else if (getLangOptions().Microsoft)
       // Microsoft enums are always of int type.
       EnumUnderlying = Context.IntTy.getTypePtr();
@@ -6427,7 +6463,9 @@ bool Sema::VerifyBitField(SourceLocation FieldLoc, IdentifierInfo *FieldName,
         << FieldName << FieldTy << BitWidth->getSourceRange();
     return Diag(FieldLoc, diag::err_not_integral_type_anon_bitfield)
       << FieldTy << BitWidth->getSourceRange();
-  }
+  } else if (DiagnoseUnexpandedParameterPack(const_cast<Expr *>(BitWidth),
+                                             UPPC_BitFieldWidth))
+    return true;
 
   // If the bit-width is type- or value-dependent, don't try to check
   // it now.
@@ -6502,8 +6540,16 @@ FieldDecl *Sema::HandleField(Scope *S, RecordDecl *Record,
 
   TypeSourceInfo *TInfo = GetTypeForDeclarator(D, S);
   QualType T = TInfo->getType();
-  if (getLangOptions().CPlusPlus)
+  if (getLangOptions().CPlusPlus) {
     CheckExtraCXXDefaultArguments(D);
+
+    if (DiagnoseUnexpandedParameterPack(D.getIdentifierLoc(), TInfo,
+                                        UPPC_DataMemberType)) {
+      D.setInvalidType();
+      T = Context.IntTy;
+      TInfo = Context.getTrivialTypeSourceInfo(T, Loc);
+    }
+  }
 
   DiagnoseFunctionSpecifiers(D);
 
@@ -7312,6 +7358,10 @@ EnumConstantDecl *Sema::CheckEnumConstant(EnumDecl *Enum,
   unsigned IntWidth = Context.Target.getIntWidth();
   llvm::APSInt EnumVal(IntWidth);
   QualType EltTy;
+
+  if (Val && DiagnoseUnexpandedParameterPack(Val, UPPC_EnumeratorValue))
+    Val = 0;
+
   if (Val) {
     if (Enum->isDependentType() || Val->isTypeDependent())
       EltTy = Context.DependentTy;
@@ -7717,7 +7767,8 @@ void Sema::ActOnEnumBody(SourceLocation EnumLoc, SourceLocation LBraceLoc,
     ECD->setInitVal(InitVal);
 
     // Adjust the Expr initializer and type.
-    if (ECD->getInitExpr())
+    if (ECD->getInitExpr() &&
+	!Context.hasSameType(NewTy, ECD->getInitExpr()->getType()))
       ECD->setInitExpr(ImplicitCastExpr::Create(Context, NewTy,
                                                 CK_IntegralCast,
                                                 ECD->getInitExpr(),

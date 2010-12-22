@@ -353,6 +353,12 @@ HandleExprPropertyRefExpr(const ObjCObjectPointerType *OPT,
   ObjCInterfaceDecl *IFace = IFaceT->getDecl();
   IdentifierInfo *Member = MemberName.getAsIdentifierInfo();
 
+  if (IFace->isForwardDecl()) {
+    Diag(MemberLoc, diag::err_property_not_found_forward_class)
+         << MemberName << QualType(OPT, 0);
+    Diag(IFace->getLocation(), diag::note_forward_class);
+    return ExprError();
+  }
   // Search for a declared property first.
   if (ObjCPropertyDecl *PD = IFace->FindPropertyDeclaration(Member)) {
     // Check whether we can reference this property.
@@ -1017,6 +1023,7 @@ ExprResult Sema::BuildInstanceMessage(Expr *Receiver,
               break;
           }
         }
+        bool forwardClass = false;
         if (!Method) {
           // If we have implementations in scope, check "private" methods.
           Method = LookupPrivateInstanceMethod(Sel, ClassDecl);
@@ -1027,14 +1034,15 @@ ExprResult Sema::BuildInstanceMessage(Expr *Receiver,
             // compatibility. FIXME: should we deviate??
             if (OCIType->qual_empty()) {
               Method = LookupInstanceMethodInGlobalPool(Sel,
-                                                 SourceRange(LBracLoc, RBracLoc)); 
-              if (Method && !OCIType->getInterfaceDecl()->isForwardDecl())
+                                                 SourceRange(LBracLoc, RBracLoc));
+              forwardClass = OCIType->getInterfaceDecl()->isForwardDecl();
+              if (Method && !forwardClass)
                 Diag(Loc, diag::warn_maynot_respond)
                   << OCIType->getInterfaceDecl()->getIdentifier() << Sel;
             }
           }
         }
-        if (Method && DiagnoseUseOfDecl(Method, Loc))
+        if (Method && DiagnoseUseOfDecl(Method, Loc, forwardClass))
           return ExprError();
       } else if (!Context.getObjCIdType().isNull() &&
                  (ReceiverType->isPointerType() || 

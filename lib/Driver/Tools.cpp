@@ -167,11 +167,9 @@ void Clang::AddPreprocessingOptions(const Driver &D,
         // Otherwise derive from the base input.
         //
         // FIXME: This should use the computed output file location.
-        llvm::sys::Path P(Inputs[0].getBaseInput());
-
-        P.eraseSuffix();
-        P.appendSuffix("o");
-        DepTarget = Args.MakeArgString(P.getLast());
+        llvm::SmallString<128> P(Inputs[0].getBaseInput());
+        llvm::sys::path::replace_extension(P, "o");
+        DepTarget = Args.MakeArgString(llvm::sys::path::filename(P));
       }
 
       CmdArgs.push_back("-MT");
@@ -1149,9 +1147,6 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
       A->render(Args, CmdArgs);
   }
 
-  // Silence warning for "clang -O2 -O0 -c foo.c -o foo.o"
-  Args.ClaimAllArgs(options::OPT_O_Group);
-
   Args.AddAllArgs(CmdArgs, options::OPT_W_Group);
   Args.AddLastArg(CmdArgs, options::OPT_pedantic);
   Args.AddLastArg(CmdArgs, options::OPT_pedantic_errors);
@@ -1926,8 +1921,8 @@ const char *darwin::CC1::getCC1Name(types::ID Type) const {
 
 const char *darwin::CC1::getBaseInputName(const ArgList &Args,
                                           const InputInfoList &Inputs) {
-  llvm::sys::Path P(Inputs[0].getBaseInput());
-  return Args.MakeArgString(P.getLast());
+  return Args.MakeArgString(
+    llvm::sys::path::filename(Inputs[0].getBaseInput()));
 }
 
 const char *darwin::CC1::getBaseInputStem(const ArgList &Args,
