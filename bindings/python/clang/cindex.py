@@ -631,13 +631,23 @@ _clang_getDiagnosticFixIt.errcheck = _CXString.from_result
 
 ###
 
-class CodeCompletionChunk:
+class CompletionChunk:
+    class Kind:
+        def __init__(self, name):
+            self.name = name
+
+        def __str__(self):
+            return self.name
+
+        def __repr__(self):
+            return "<ChunkKind: %s>" % self
+
     def __init__(self, completionString, key):
         self.cs = completionString
         self.key = key
 
     def __repr__(self):
-        return self.spelling
+        return "{'" + self.spelling + "', " + str(self.kind) + "}"
 
     @property
     def spelling(self):
@@ -645,7 +655,31 @@ class CodeCompletionChunk:
 
     @property
     def kind(self):
-        return _clang_getCompletionChunkKind(self.cs, self.key)
+        chunkKinds = {
+            0: self.Kind("Optional"),
+            1: self.Kind("TypedText"),
+            2: self.Kind("Text"),
+            3: self.Kind("Placeholder"),
+            4: self.Kind("Informative"),
+            5: self.Kind("CurrentParameter"),
+            6: self.Kind("LeftParen"),
+            7: self.Kind("RightParen"),
+            8: self.Kind("LeftBracket"),
+            9: self.Kind("RightBracket"),
+            10: self.Kind("LeftBrace"),
+            11: self.Kind("RightBrace"),
+            12: self.Kind("LeftAngle"),
+            13: self.Kind("RightAngle"),
+            14: self.Kind("Comma"),
+            15: self.Kind("ResultType"),
+            16: self.Kind("Colon"),
+            17: self.Kind("SemiColon"),
+            18: self.Kind("Equal"),
+            19: self.Kind("HorizontalSpace"),
+            20: self.Kind("VerticalSpace")}
+
+        res = _clang_getCompletionChunkKind(self.cs, self.key)
+        return chunkKinds[res]
 
     @property
     def string(self):
@@ -663,7 +697,7 @@ class CompletionString(ClangObject):
     def __getitem__(self, key):
         if len(self) <= key:
             raise IndexError
-        return CodeCompletionChunk(self.obj, key)
+        return CompletionChunk(self.obj, key)
 
     @property
     def priority(self):
@@ -674,7 +708,7 @@ class CompletionString(ClangObject):
         return _clang_getCompletionAvailability(self.obj)
 
     def __repr__(self):
-        return "".join([str(a) for a in self])
+        return " | ".join([str(a) for a in self])
 
 class CodeCompletionResult(Structure):
     _fields_ = [('cursorKind', c_int), ('completionString', c_object_p)]
@@ -1115,6 +1149,14 @@ _clang_codeCompleteGetDiagnostic.restype = Diagnostic
 _clang_getCompletionChunkText = lib.clang_getCompletionChunkText
 _clang_getCompletionChunkText.argtypes = [c_void_p, c_int]
 _clang_getCompletionChunkText.restype = _CXString
+
+_clang_getCompletionChunkKind = lib.clang_getCompletionChunkKind
+_clang_getCompletionChunkKind.argtypes = [c_void_p, c_int]
+_clang_getCompletionChunkKind.restype = c_int
+
+_clang_getCompletionChunkCompletionString = lib.clang_getCompletionChunkCompletionString
+_clang_getCompletionChunkCompletionString.argtypes = [c_void_p, c_int]
+_clang_getCompletionChunkCompletionString.restype = c_object_p
 
 _clang_getNumCompletionChunks = lib.clang_getNumCompletionChunks
 _clang_getNumCompletionChunks.argtypes = [c_void_p]
