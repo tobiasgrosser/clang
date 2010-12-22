@@ -637,21 +637,54 @@ class CodeCompletionChunk:
         self.key = key
 
     def __repr__(self):
+        return self.spelling
+
+    @property
+    def spelling(self):
         return _clang_getCompletionChunkText(self.cs, self.key).spelling
 
-class CodeCompletionResult(Structure):
-    _fields_ = [('cursorKind', c_int), ('completionString', c_void_p)]
+    @property
+    def kind(self):
+        return _clang_getCompletionChunkKind(self.cs, self.key)
 
+    @property
+    def string(self):
+        res = _clang_getCompletionChunkCompletionString(self.cs, self.key)
+
+        if (res):
+          return CompletionString(res)
+        else:
+          None
+
+class CompletionString(ClangObject):
     def __len__(self):
-        return _clang_getNumCompletionChunks(self.completionString)
+        return _clang_getNumCompletionChunks(self.obj)
 
     def __getitem__(self, key):
         if len(self) <= key:
             raise IndexError
-        return CodeCompletionChunk(self.completionString, key)
+        return CodeCompletionChunk(self.obj, key)
+
+    @property
+    def priority(self):
+        return _clang_getCompletionPriority(self.obj)
+
+    @property
+    def availability(self):
+        return _clang_getCompletionAvailability(self.obj)
 
     def __repr__(self):
         return "".join([str(a) for a in self])
+
+class CodeCompletionResult(Structure):
+    _fields_ = [('cursorKind', c_int), ('completionString', c_object_p)]
+
+    def __repr__(self):
+        return str(CompletionString(self.completionString))
+
+    @property
+    def string(self):
+        return CompletionString(self.completionString)
 
 class CCRStructure(Structure):
     _fields_ = [('results', POINTER(CodeCompletionResult)),
@@ -1086,6 +1119,15 @@ _clang_getCompletionChunkText.restype = _CXString
 _clang_getNumCompletionChunks = lib.clang_getNumCompletionChunks
 _clang_getNumCompletionChunks.argtypes = [c_void_p]
 _clang_getNumCompletionChunks.restype = c_int
+
+_clang_getCompletionAvailability = lib.clang_getCompletionAvailability
+_clang_getCompletionAvailability.argtypes = [c_void_p]
+_clang_getCompletionAvailability.restype = c_int
+
+_clang_getCompletionPriority = lib.clang_getCompletionPriority
+_clang_getCompletionPriority.argtypes = [c_void_p]
+_clang_getCompletionPriority.restype = c_int
+
 
 ###
 
